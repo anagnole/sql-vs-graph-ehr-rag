@@ -18,10 +18,11 @@
     "ui": "npm run ui:build && tsx src/api/server.ts"
   },
   "dependencies": {
-    "@anagnole/claude-cli-wrapper": "^0.3.0",
+    "@anagnole/claude-cli-wrapper": "^0.3.1",
     "@fastify/cors": "^11.2.0",
     "@fastify/static": "^9.0.0",
     "@fastify/websocket": "^11.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@vitejs/plugin-react": "^6.0.1",
     "concurrently": "^9.2.1",
     "csv-parse": "^5.6.0",

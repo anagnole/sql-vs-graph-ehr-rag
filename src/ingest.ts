@@ -12,11 +12,12 @@
  */
 
 import kuzu from 'kuzu';
-import { createReadStream, readFileSync, writeFileSync, createWriteStream, mkdirSync, rmSync, existsSync } from 'node:fs';
+import { createReadStream, readFileSync, writeFileSync, createWriteStream, mkdirSync, rmSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { createRequire } from 'node:module';
+import { execSync } from 'node:child_process';
 const require = createRequire(import.meta.url);
 const { parser } = require('stream-json');
 const { streamObject } = require('stream-json/streamers/StreamObject');
@@ -25,11 +26,45 @@ import type {
   Patient, Encounter, Condition, Medication,
   Observation, Procedure, Provider, Organization,
 } from './parser/types.js';
+import { normalizeObservation, LOINC_SPECS, getReferenceRange } from './clinical/loinc-normalization.js';
+import { COMPLICATION_EDGES } from './clinical/snomed-complications.js';
 
 const PROJECT_ROOT = join(import.meta.dirname, '..');
-const DB_PATH = join(PROJECT_ROOT, '.brainifai', 'data', 'kuzu');
 const GEN_DIR = join(PROJECT_ROOT, 'data', 'generated');
-const TMP_DIR = join(PROJECT_ROOT, '.tmp-csv');
+
+// CLI: --tier <name> selects a tier-specific patient subset and DB path.
+// Without --tier, ingests the full dataset into the default kuzu DB.
+const argv = process.argv.slice(2);
+const tierFlag = (() => {
+  const i = argv.indexOf('--tier');
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+})();
+
+const DB_PATH = tierFlag
+  ? join(PROJECT_ROOT, '.brainifai', 'data', `kuzu-${tierFlag}`)
+  : join(PROJECT_ROOT, '.brainifai', 'data', 'kuzu');
+
+const TMP_DIR = join(PROJECT_ROOT, tierFlag ? `.tmp-csv-${tierFlag}` : '.tmp-csv');
+
+// Load patient allowlist if tier specified — patients not in this set are skipped
+// during streaming, producing a Kuzu DB containing only the tier's cohort.
+const tierAllowlist: Set<string> | null = (() => {
+  if (!tierFlag) return null;
+  const tierFile = join(GEN_DIR, `tier-${tierFlag}.json`);
+  if (!existsSync(tierFile)) {
+    console.error(`Tier file not found: ${tierFile}`);
+    console.error(`Run: npx tsx scripts/curate-tiers.ts to generate tier-*.json files`);
+    process.exit(1);
+  }
+  const ids: string[] = JSON.parse(readFileSync(tierFile, 'utf-8'));
+  return new Set(ids);
+})();
+
+if (tierFlag) {
+  console.log(`Tier mode: --tier ${tierFlag}`);
+  console.log(`  DB path: ${DB_PATH}`);
+  console.log(`  Allowlist: ${tierAllowlist!.size} patients`);
+}
 
 // ─── CSV helpers ──────────────────────────────────────────────────────────────
 
@@ -42,6 +77,17 @@ function escapeCsv(val: unknown): string {
   return s;
 }
 
+// Synthea emits a mix of bare dates ("2017-09-23") and ISO datetimes
+// ("2017-09-23T14:47:33Z"). Kuzu's DATE type requires the bare form, so
+// truncate anything with a 'T' separator. Empty/null passes through for NULL.
+function toDateString(val: unknown): string {
+  if (val === null || val === undefined) return '';
+  const s = String(val);
+  if (!s) return '';
+  const tIdx = s.indexOf('T');
+  return tIdx > 0 ? s.slice(0, tIdx) : s;
+}
+
 function writeCsvLine(fd: import('node:fs').WriteStream, values: unknown[]): void {
   fd.write(values.map(escapeCsv).join(',') + '\n');
 }
@@ -50,10 +96,13 @@ function writeCsvHeader(fd: import('node:fs').WriteStream, headers: string[]): v
   fd.write(headers.join(',') + '\n');
 }
 
+const DATE_FIELD_NAMES = new Set(['birth_date', 'death_date', 'start_date', 'stop_date', 'date']);
+
 function mapOne(item: Record<string, unknown>, fieldMap: Record<string, string>): Record<string, unknown> {
   const row: Record<string, unknown> = {};
   for (const [camel, snake] of Object.entries(fieldMap)) {
-    row[snake] = item[camel] ?? '';
+    const raw = item[camel] ?? '';
+    row[snake] = DATE_FIELD_NAMES.has(snake) ? toDateString(raw) : raw;
   }
   return row;
 }
@@ -109,11 +158,9 @@ async function ingest() {
   console.log('Starting EHR data ingestion (concept node model)...');
   const startTime = Date.now();
 
-  if (!existsSync(DB_PATH)) {
-    console.error(`Kuzu DB not found at ${DB_PATH}. Run 'brainifai init --type ehr' first.`);
-    process.exit(1);
-  }
-
+  // Ensure parent dir exists. Kuzu refuses to use a pre-created directory —
+  // it wants to initialize the DB itself, so we only mkdir the parent.
+  mkdirSync(join(DB_PATH, '..'), { recursive: true });
   mkdirSync(TMP_DIR, { recursive: true });
 
   const db = new kuzu.Database(DB_PATH);
@@ -158,9 +205,26 @@ async function ingest() {
     const medTreats = new Map<string, Set<string>>();     // med code → Set<condition code>
     const procIndicatedBy = new Map<string, Set<string>>(); // proc code → Set<condition code>
 
-    // Patient CSV writer
+    // Patient CSV writer. Column order mirrors the Patient NODE TABLE schema.
     const patWriter = createWriteStream(join(TMP_DIR, 'patients.csv'), 'utf-8');
-    writeCsvHeader(patWriter, Object.values(PATIENT_FIELDS));
+    const PATIENT_CSV_COLS = [
+      'patient_id', 'first_name', 'last_name', 'birth_date', 'death_date', 'age_years',
+      'gender', 'race', 'ethnicity', 'marital_status', 'city', 'state', 'zip',
+    ];
+    writeCsvHeader(patWriter, PATIENT_CSV_COLS);
+    const ingestDateIso = new Date().toISOString().slice(0, 10);
+
+    function yearsBetween(birthIso: string, asOfIso: string): number | '' {
+      if (!birthIso) return '';
+      const b = new Date(birthIso);
+      const a = new Date(asOfIso);
+      if (Number.isNaN(b.getTime()) || Number.isNaN(a.getTime())) return '';
+      let years = a.getUTCFullYear() - b.getUTCFullYear();
+      const monthDiff = a.getUTCMonth() - b.getUTCMonth();
+      const dayDiff = a.getUTCDate() - b.getUTCDate();
+      if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) years--;
+      return years;
+    }
 
     // Encounter CSV writer
     const encWriter = createWriteStream(join(TMP_DIR, 'encounters.csv'), 'utf-8');
@@ -174,7 +238,7 @@ async function ingest() {
     writeCsvHeader(prescWriter, ['patient_id', 'code', 'start_date', 'stop_date', 'encounter_id', 'reason_code', 'reason_description']);
 
     const resultWriter = createWriteStream(join(TMP_DIR, 'has_result.csv'), 'utf-8');
-    writeCsvHeader(resultWriter, ['patient_id', 'code', 'value', 'units', 'date', 'encounter_id', 'category', 'type']);
+    writeCsvHeader(resultWriter, ['patient_id', 'code', 'value', 'units', 'value_canonical', 'units_canonical', 'date', 'encounter_id', 'category', 'type']);
 
     const underwentWriter = createWriteStream(join(TMP_DIR, 'underwent.csv'), 'utf-8');
     writeCsvHeader(underwentWriter, ['patient_id', 'code', 'start_date', 'stop_date', 'encounter_id', 'reason_code', 'reason_description']);
@@ -215,9 +279,22 @@ async function ingest() {
 
           const pid = entry.patient.id;
 
-          // Patient node
+          // Tier filter: skip patients not in the allowlist (and all their records).
+          // This is the only place we apply the filter — by skipping early we ensure
+          // no orphan encounters/conditions/etc reference patients that won't exist.
+          if (tierAllowlist && !tierAllowlist.has(pid)) {
+            callback();
+            return;
+          }
+
+          // Patient node. age_years computed as of ingest date (or at death, if
+          // the patient is deceased) so cohort age filters run without date math.
           const pRow = mapOne(entry.patient as unknown as Record<string, unknown>, PATIENT_FIELDS);
-          patWriter.write(toCsvLine(Object.values(PATIENT_FIELDS), pRow) + '\n');
+          const birth = String(pRow.birth_date ?? '');
+          const death = String(pRow.death_date ?? '');
+          const referenceForAge = death && death < ingestDateIso ? death : ingestDateIso;
+          pRow.age_years = yearsBetween(birth, referenceForAge);
+          patWriter.write(toCsvLine(PATIENT_CSV_COLS, pRow) + '\n');
 
           // Encounters
           for (const e of entry.encounters) {
@@ -245,7 +322,7 @@ async function ingest() {
             if (!conceptConditions.has(c.code)) {
               conceptConditions.set(c.code, { code: c.code, system: c.system || 'SNOMED-CT', description: c.description });
             }
-            writeCsvLine(diagWriter, [pid, c.code, c.startDate, c.stopDate ?? '', c.encounterId]);
+            writeCsvLine(diagWriter, [pid, c.code, toDateString(c.startDate), toDateString(c.stopDate ?? ''), c.encounterId]);
             condCount++;
           }
 
@@ -254,7 +331,7 @@ async function ingest() {
             if (!conceptMedications.has(m.code)) {
               conceptMedications.set(m.code, { code: m.code, description: m.description });
             }
-            writeCsvLine(prescWriter, [pid, m.code, m.startDate, m.stopDate ?? '', m.encounterId, m.reasonCode, m.reasonDescription]);
+            writeCsvLine(prescWriter, [pid, m.code, toDateString(m.startDate), toDateString(m.stopDate ?? ''), m.encounterId, m.reasonCode, m.reasonDescription]);
             medCount++;
 
             // Collect TREATS cross-concept mapping
@@ -264,7 +341,7 @@ async function ingest() {
             }
           }
 
-          // Observations → concept + relationship
+          // Observations → concept + relationship, with unit normalization
           for (const o of entry.observations) {
             if (!conceptObservations.has(o.code)) {
               conceptObservations.set(o.code, {
@@ -272,7 +349,13 @@ async function ingest() {
                 category: o.category, units: o.units, type: o.type,
               });
             }
-            writeCsvLine(resultWriter, [pid, o.code, o.value, o.units, o.date, o.encounterId, o.category, o.type]);
+            const norm = normalizeObservation(o.code, o.value, o.units);
+            writeCsvLine(resultWriter, [
+              pid, o.code, o.value, o.units,
+              norm.valueCanonical ?? '',
+              norm.unitCanonical ?? '',
+              toDateString(o.date), o.encounterId, o.category, o.type,
+            ]);
             obsCount++;
           }
 
@@ -281,7 +364,7 @@ async function ingest() {
             if (!conceptProcedures.has(p.code)) {
               conceptProcedures.set(p.code, { code: p.code, system: p.system || 'SNOMED-CT', description: p.description });
             }
-            writeCsvLine(underwentWriter, [pid, p.code, p.startDate, p.stopDate ?? '', p.encounterId, p.reasonCode, p.reasonDescription]);
+            writeCsvLine(underwentWriter, [pid, p.code, toDateString(p.startDate), toDateString(p.stopDate ?? ''), p.encounterId, p.reasonCode, p.reasonDescription]);
             procCount++;
 
             // Collect INDICATED_BY cross-concept mapping
@@ -338,9 +421,33 @@ async function ingest() {
     writeFileSync(cmFile, cmLines.join('\n'), 'utf-8');
 
     const coFile = join(TMP_DIR, 'concept_observations.csv');
-    const coLines = ['code,description,category,units,type'];
-    for (const o of conceptObservations.values()) coLines.push([o.code, o.description, o.category, o.units, o.type].map(escapeCsv).join(','));
+    const coLines = ['code,description,category,units,type,canonical_unit,normal_low,normal_high,critical_low,critical_high,range_source'];
+    let rangesPopulated = 0;
+    // Kuzu's CSV parser trims trailing empty fields. Force the row to keep its
+    // full width by quoting empty fields and guaranteeing the last column has a
+    // non-empty value ("synthea" when no curated range is available).
+    const emptyQuoted = '""';
+    for (const o of conceptObservations.values()) {
+      const spec = LOINC_SPECS.find((s) => s.code === o.code);
+      const range = getReferenceRange(o.code);
+      if (range) rangesPopulated++;
+      const row = [
+        escapeCsv(o.code),
+        escapeCsv(o.description),
+        escapeCsv(o.category),
+        escapeCsv(o.units),
+        escapeCsv(o.type),
+        spec?.conversion.canonicalUnit ? escapeCsv(spec.conversion.canonicalUnit) : emptyQuoted,
+        range?.normalLow != null ? String(range.normalLow) : emptyQuoted,
+        range?.normalHigh != null ? String(range.normalHigh) : emptyQuoted,
+        range?.criticalLow != null ? String(range.criticalLow) : emptyQuoted,
+        range?.criticalHigh != null ? String(range.criticalHigh) : emptyQuoted,
+        range?.source ? escapeCsv(range.source) : escapeCsv("synthea"),
+      ];
+      coLines.push(row.join(','));
+    }
     writeFileSync(coFile, coLines.join('\n'), 'utf-8');
+    console.log(`  ConceptObservation reference ranges populated: ${rangesPopulated} / ${conceptObservations.size}`);
 
     const cpFile = join(TMP_DIR, 'concept_procedures.csv');
     const cpLines = ['code,system,description'];
@@ -373,68 +480,23 @@ async function ingest() {
     writeFileSync(indicatedByFile, indicatedByLines.join('\n'), 'utf-8');
     console.log(`  INDICATED_BY edges: ${indicatedByLines.length - 1}`);
 
-    // COMPLICATION_OF edges — derive from condition descriptions
+    // COMPLICATION_OF edges from the curated SNOMED-CT map. Previous versions
+    // used a word-overlap heuristic (≥50% token overlap between child desc and
+    // extracted "due to" phrase) — dropped in favor of hand-verified pairs that
+    // actually match SNOMED hierarchy or disease-causation semantics.
     const complicationOfFile = join(TMP_DIR, 'complication_of.csv');
     const complicationOfLines = ['complication_code,parent_code'];
-    const complicationSeen = new Set<string>();
-
-    // Build lookup: clean description (no disorder/finding suffix) → code
-    const condByCleanDesc = new Map<string, string>();
-    for (const c of conceptConditions.values()) {
-      const clean = c.description.toLowerCase().replace(/\s*\((?:disorder|finding|situation)\)$/, '').trim();
-      condByCleanDesc.set(clean, c.code);
-    }
-
-    for (const c of conceptConditions.values()) {
-      const desc = c.description.toLowerCase();
-
-      // Match "X due to Y" — extract Y and find the parent condition
-      const dueToMatch = desc.match(/due to (.+?)(?:\s*\((?:disorder|finding)\))?$/);
-      if (dueToMatch) {
-        const parentPhrase = dueToMatch[1].trim();
-        // Find the best match using word overlap scoring
-        const parentWords = new Set(parentPhrase.split(/\s+/).filter(w => w.length > 2));
-        let bestCode: string | null = null;
-        let bestScore = 0;
-        for (const [cleanDesc, code] of condByCleanDesc) {
-          if (code === c.code) continue;
-          if (cleanDesc.includes('due to')) continue;
-          const descWords = new Set(cleanDesc.split(/\s+/).filter(w => w.length > 2));
-          // Count how many significant words overlap
-          let overlap = 0;
-          for (const w of parentWords) {
-            if (descWords.has(w)) overlap++;
-          }
-          // Score: overlap relative to parent phrase length
-          const score = overlap / parentWords.size;
-          if (score > bestScore && score >= 0.5) {
-            bestScore = score;
-            bestCode = code;
-          }
-        }
-        if (bestCode) {
-          const key = `${c.code}:${bestCode}`;
-          if (!complicationSeen.has(key)) {
-            complicationOfLines.push([c.code, bestCode].map(escapeCsv).join(','));
-            complicationSeen.add(key);
-          }
-        }
+    let complicationDropped = 0;
+    for (const edge of COMPLICATION_EDGES) {
+      // Both codes must exist as concepts in this tier's cohort
+      if (!conceptConditions.has(edge.childCode) || !conceptConditions.has(edge.parentCode)) {
+        complicationDropped++;
+        continue;
       }
-
-      // "diabetic X" without "due to" → link to diabetes
-      if (desc.includes('diabetic') && !desc.includes('due to')) {
-        const diabetesCode = condByCleanDesc.get('diabetes mellitus type 2');
-        if (diabetesCode && diabetesCode !== c.code) {
-          const key = `${c.code}:${diabetesCode}`;
-          if (!complicationSeen.has(key)) {
-            complicationOfLines.push([c.code, diabetesCode].map(escapeCsv).join(','));
-            complicationSeen.add(key);
-          }
-        }
-      }
+      complicationOfLines.push([edge.childCode, edge.parentCode].map(escapeCsv).join(','));
     }
     writeFileSync(complicationOfFile, complicationOfLines.join('\n'), 'utf-8');
-    console.log(`  COMPLICATION_OF edges: ${complicationOfLines.length - 1}`);
+    console.log(`  COMPLICATION_OF edges: ${complicationOfLines.length - 1} (${complicationDropped} map entries skipped — parent/child not in cohort)`);
 
     // Small delay to let file streams flush
     await new Promise((r) => setTimeout(r, 500));
@@ -443,6 +505,23 @@ async function ingest() {
 
     console.log('\nCreating schema...');
     await conn.query('LOAD EXTENSION fts');
+
+    // FTS indexes block DROP TABLE on the node they reference — drop them first.
+    // (The list mirrors the CREATE_FTS_INDEX calls at the end of ingest.)
+    const ftsIndexesToDrop: [string, string][] = [
+      ['Patient', 'patient_fts'],
+      ['ConceptCondition', 'condition_fts'],
+      ['ConceptMedication', 'medication_fts'],
+      ['ConceptObservation', 'observation_fts'],
+      ['ConceptProcedure', 'procedure_fts'],
+      ['Provider', 'provider_fts'],
+      ['Organization', 'organization_fts'],
+    ];
+    for (const [table, index] of ftsIndexesToDrop) {
+      try {
+        await conn.query(`CALL DROP_FTS_INDEX('${table}', '${index}')`);
+      } catch { /* may not exist */ }
+    }
 
     // Drop everything — query all tables and drop them
     // First drop all relationship tables, then all node tables
@@ -485,7 +564,12 @@ async function ingest() {
       code STRING, description STRING, PRIMARY KEY (code)
     )`);
     await conn.query(`CREATE NODE TABLE ConceptObservation (
-      code STRING, description STRING, category STRING, units STRING, type STRING, PRIMARY KEY (code)
+      code STRING, description STRING, category STRING, units STRING, type STRING,
+      canonical_unit STRING,
+      normal_low DOUBLE, normal_high DOUBLE,
+      critical_low DOUBLE, critical_high DOUBLE,
+      range_source STRING,
+      PRIMARY KEY (code)
     )`);
     await conn.query(`CREATE NODE TABLE ConceptProcedure (
       code STRING, system STRING, description STRING, PRIMARY KEY (code)
@@ -501,7 +585,9 @@ async function ingest() {
       PRIMARY KEY (provider_id)
     )`);
     await conn.query(`CREATE NODE TABLE Patient (
-      patient_id STRING, first_name STRING, last_name STRING, birth_date STRING, death_date STRING,
+      patient_id STRING, first_name STRING, last_name STRING,
+      birth_date DATE, death_date DATE,
+      age_years INT64,
       gender STRING, race STRING, ethnicity STRING, marital_status STRING,
       city STRING, state STRING, zip STRING,
       PRIMARY KEY (patient_id)
@@ -509,31 +595,36 @@ async function ingest() {
     await conn.query(`CREATE NODE TABLE Encounter (
       encounter_id STRING, patient_id STRING, provider_id STRING, organization_id STRING,
       encounter_class STRING, code STRING, description STRING,
-      start_date STRING, stop_date STRING, reason_code STRING, reason_description STRING,
+      start_date DATE, stop_date DATE, reason_code STRING, reason_description STRING,
       PRIMARY KEY (encounter_id)
     )`);
 
-    // Relationship tables with properties
+    // Relationship tables with properties. Dates are DATE (was STRING) — Kuzu
+    // parses YYYY-MM-DD strings at COPY and treats empty CSV fields as NULL.
+    // Tool-side, q() normalizes Date objects back to YYYY-MM-DD strings so the
+    // API response shape is unchanged for consumers.
     await conn.query(`CREATE REL TABLE DIAGNOSED_WITH (
       FROM Patient TO ConceptCondition,
-      start_date STRING, stop_date STRING, encounter_id STRING,
+      start_date DATE, stop_date DATE, encounter_id STRING,
       MANY_MANY
     )`);
     await conn.query(`CREATE REL TABLE PRESCRIBED (
       FROM Patient TO ConceptMedication,
-      start_date STRING, stop_date STRING, encounter_id STRING,
+      start_date DATE, stop_date DATE, encounter_id STRING,
       reason_code STRING, reason_description STRING,
       MANY_MANY
     )`);
     await conn.query(`CREATE REL TABLE HAS_RESULT (
       FROM Patient TO ConceptObservation,
-      value STRING, units STRING, date STRING, encounter_id STRING,
+      value STRING, units STRING,
+      value_canonical DOUBLE, units_canonical STRING,
+      date DATE, encounter_id STRING,
       category STRING, type STRING,
       MANY_MANY
     )`);
     await conn.query(`CREATE REL TABLE UNDERWENT (
       FROM Patient TO ConceptProcedure,
-      start_date STRING, stop_date STRING, encounter_id STRING,
+      start_date DATE, stop_date DATE, encounter_id STRING,
       reason_code STRING, reason_description STRING,
       MANY_MANY
     )`);
@@ -613,6 +704,90 @@ async function ingest() {
       try { await conn.query(stmt); } catch { /* may already exist */ }
     }
     console.log('FTS indexes created.');
+
+    // ── 7. Provenance manifest ──────────────────────────────────────────
+
+    console.log('\nWriting provenance manifest...');
+
+    // Git SHA (best-effort — tolerates missing git / detached worktree)
+    let gitSha = "unknown";
+    let gitDirty = false;
+    try {
+      gitSha = execSync("git rev-parse HEAD", { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      gitDirty = execSync("git status --porcelain", { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "ignore"] }).toString().trim().length > 0;
+    } catch { /* not a git repo or git missing */ }
+
+    // Source file metadata (Synthea version isn't embedded in the data, so we
+    // record the file's mtime + size as a weaker fingerprint)
+    const patientsPath = join(GEN_DIR, 'patients.json');
+    const patientsStat = existsSync(patientsPath) ? statSync(patientsPath) : null;
+
+    const manifest = {
+      ingest_timestamp: new Date().toISOString(),
+      tier: tierFlag ?? "full",
+      db_path: DB_PATH,
+      git: { sha: gitSha, dirty: gitDirty },
+      source: {
+        patients_json: patientsPath,
+        patients_json_mtime: patientsStat?.mtime.toISOString() ?? null,
+        patients_json_bytes: patientsStat?.size ?? null,
+      },
+      counts: {
+        patients: patientCount,
+        encounters: encCount,
+        providers: providers.length,
+        organizations: organizations.length,
+        concept_conditions: conceptConditions.size,
+        concept_medications: conceptMedications.size,
+        concept_observations: conceptObservations.size,
+        concept_procedures: conceptProcedures.size,
+        condition_instances: condCount,
+        medication_instances: medCount,
+        observation_instances: obsCount,
+        procedure_instances: procCount,
+      },
+      derived_edges: {
+        treats: treatsLines.length - 1,
+        indicated_by: indicatedByLines.length - 1,
+        complication_of: complicationOfLines.length - 1,
+        reason_for: reasonForCount,
+      },
+      elapsed_seconds: (Date.now() - startTime) / 1000,
+    };
+
+    const manifestPath = join(GEN_DIR, tierFlag ? `manifest-${tierFlag}.json` : 'manifest.json');
+    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+    console.log(`  Manifest: ${manifestPath}`);
+
+    // Also store the manifest inline as a Metadata node in the DB so consumers
+    // (MCP clients, eval runs) can read provenance without hitting the filesystem.
+    try {
+      await conn.query(`CREATE NODE TABLE Metadata (
+        key STRING, value STRING, PRIMARY KEY (key)
+      )`);
+    } catch { /* may already exist from a previous run */ }
+    const metaRows: [string, string][] = [
+      ["ingest_timestamp", manifest.ingest_timestamp],
+      ["tier", manifest.tier],
+      ["git_sha", gitSha],
+      ["git_dirty", String(gitDirty)],
+      ["patient_count", String(patientCount)],
+      ["encounter_count", String(encCount)],
+      ["concept_count", String(conceptConditions.size + conceptMedications.size + conceptObservations.size + conceptProcedures.size)],
+      ["manifest_json", JSON.stringify(manifest)],
+    ];
+    for (const [key, value] of metaRows) {
+      try {
+        const prep = await conn.prepare(`MERGE (m:Metadata {key: $key}) SET m.value = $value`);
+        await conn.execute(prep, { key, value });
+      } catch { /* Kuzu MERGE syntax may differ — fall back to CREATE */
+        try {
+          const prep = await conn.prepare(`CREATE (m:Metadata {key: $key, value: $value})`);
+          await conn.execute(prep, { key, value });
+        } catch { /* dup key — acceptable */ }
+      }
+    }
+    console.log('  Metadata node written.');
 
     // ── Done ────────────────────────────────────────────────────────────
 

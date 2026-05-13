@@ -1,5 +1,5 @@
 import type { ParsedDataset } from "../parser/types.js";
-import type { DataProfile, GroundTruthQuestion } from "./types.js";
+import { type DataProfile, type GroundTruthQuestion, isPlausibleValue, normalizeUnits } from "./types.js";
 
 let counter = 0;
 function id() {
@@ -12,11 +12,49 @@ export function generateSimpleLookup(
 ): GroundTruthQuestion[] {
   counter = 0;
   const questions: GroundTruthQuestion[] = [];
-
-  // Pick patients deterministically — sort by ID, take first N with relevant data
   const sortedPatients = [...ds.patients].sort((a, b) => a.id.localeCompare(b.id));
 
-  // 1. Most recent lab value for a patient (target ~8 questions)
+  // Surface-form rotation per category. Deterministic (counter % templates.length)
+  // so regeneration produces identical questions. Templates phrase the same
+  // semantic question differently — kills the "99% identical template" reviewer
+  // concern without changing what is being asked or the ground truth.
+  const labTemplates = [
+    (name: string, p: string, id: string) => `What is the most recent ${name} value for patient ${p} (ID: ${id})?`,
+    (name: string, p: string, id: string) => `What is patient ${p}'s (ID: ${id}) latest ${name} measurement?`,
+    (name: string, p: string, id: string) => `Retrieve the most recent ${name} result for patient ${p} (ID: ${id}).`,
+    (name: string, p: string, id: string) => `What was the last recorded ${name} for patient ${p} (ID: ${id})?`,
+    (name: string, p: string, id: string) => `Find the latest ${name} value on file for patient ${p} (ID: ${id}).`,
+  ];
+
+  const medTemplates = [
+    (p: string, id: string) => `What medications is patient ${p} (ID: ${id}) currently taking?`,
+    (p: string, id: string) => `List the active medications for patient ${p} (ID: ${id}).`,
+    (p: string, id: string) => `Which medications is patient ${p} (ID: ${id}) prescribed at present?`,
+    (p: string, id: string) => `What is patient ${p}'s (ID: ${id}) current medication list?`,
+  ];
+
+  const condTemplates = [
+    (p: string, id: string) => `What are the active conditions for patient ${p} (ID: ${id})?`,
+    (p: string, id: string) => `List the current diagnoses for patient ${p} (ID: ${id}).`,
+    (p: string, id: string) => `Which conditions is patient ${p} (ID: ${id}) currently managing?`,
+    (p: string, id: string) => `What unresolved conditions does patient ${p} (ID: ${id}) have on record?`,
+  ];
+
+  const pcpTemplates = [
+    (p: string, id: string) => `Who is the most recent primary care provider for patient ${p} (ID: ${id})?`,
+    (p: string, id: string) => `Which provider last saw patient ${p} (ID: ${id}) for primary care?`,
+    (p: string, id: string) => `Who saw patient ${p} (ID: ${id}) at their most recent wellness visit?`,
+    (p: string, id: string) => `What is the name of patient ${p}'s (ID: ${id}) most recent primary care physician?`,
+  ];
+
+  const demoTemplates = [
+    (p: string, id: string) => `What are the demographics for patient ${p} (ID: ${id})?`,
+    (p: string, id: string) => `Give the demographic profile of patient ${p} (ID: ${id}).`,
+    (p: string, id: string) => `What are patient ${p}'s (ID: ${id}) demographic details?`,
+    (p: string, id: string) => `Summarize the demographic information on file for patient ${p} (ID: ${id}).`,
+  ];
+
+  // 1. Most recent lab value — one question per patient per lab code
   const labCodes = [
     { code: "4548-4", name: "Hemoglobin A1c", domain: "diabetes" },
     { code: "2160-0", name: "Creatinine", domain: "renal" },
@@ -28,11 +66,11 @@ export function generateSimpleLookup(
     { code: "18262-6", name: "LDL Cholesterol", domain: "cardiovascular" },
   ];
 
+  let labRot = 0;
   for (const lab of labCodes) {
-    // Find up to 2 patients with this observation
     let perCodeCount = 0;
     for (const patient of sortedPatients) {
-      if (perCodeCount >= 2) break;
+      if (perCodeCount >= 8) break;
       const obs = ds.byPatient.observations.get(patient.id);
       if (!obs) continue;
       const matching = obs
@@ -41,11 +79,14 @@ export function generateSimpleLookup(
       if (matching.length === 0) continue;
 
       const latest = matching[0];
+      if (!isPlausibleValue(lab.code, latest.value)) continue;
+      const pname = `${patient.firstName} ${patient.lastName}`;
+      const tmpl = labTemplates[labRot++ % labTemplates.length];
       questions.push({
         id: id(),
         type: "simple-lookup",
-        question: `What is the most recent ${lab.name} value for patient ${patient.firstName} ${patient.lastName} (ID: ${patient.id})?`,
-        answer: `${latest.value} ${latest.units} (recorded ${latest.date.slice(0, 10)})`,
+        question: tmpl(lab.name, pname, patient.id),
+        answer: `${latest.value} ${normalizeUnits(lab.code, latest.units)} (recorded ${latest.date.slice(0, 10)})`,
         patientIds: [patient.id],
         domain: lab.domain,
         supportingRecordIds: [latest.id],
@@ -54,10 +95,11 @@ export function generateSimpleLookup(
     }
   }
 
-  // 2. Current medications list (~8 questions)
+  // 2. Current medications list
   let medCount = 0;
+  let medRot = 0;
   for (const patient of sortedPatients) {
-    if (medCount >= 12) break;
+    if (medCount >= 40) break;
     const meds = ds.byPatient.medications.get(patient.id);
     if (!meds) continue;
     const active = meds.filter((m) => !m.stopDate);
@@ -65,10 +107,12 @@ export function generateSimpleLookup(
 
     const sorted = active.sort((a, b) => a.description.localeCompare(b.description));
     const medNames = sorted.map((m) => m.description);
+    const pname = `${patient.firstName} ${patient.lastName}`;
+    const tmpl = medTemplates[medRot++ % medTemplates.length];
     questions.push({
       id: id(),
       type: "simple-lookup",
-      question: `What medications is patient ${patient.firstName} ${patient.lastName} (ID: ${patient.id}) currently taking?`,
+      question: tmpl(pname, patient.id),
       answer: medNames.join("; "),
       patientIds: [patient.id],
       domain: "medications",
@@ -77,10 +121,11 @@ export function generateSimpleLookup(
     medCount++;
   }
 
-  // 3. Active conditions list (~8 questions)
+  // 3. Active conditions list
   let condCount = 0;
+  let condRot = 0;
   for (const patient of sortedPatients) {
-    if (condCount >= 12) break;
+    if (condCount >= 40) break;
     const conds = ds.byPatient.conditions.get(patient.id);
     if (!conds) continue;
     const active = conds.filter((c) => !c.stopDate);
@@ -88,10 +133,12 @@ export function generateSimpleLookup(
 
     const sorted = active.sort((a, b) => a.description.localeCompare(b.description));
     const condNames = [...new Set(sorted.map((c) => c.description))];
+    const pname = `${patient.firstName} ${patient.lastName}`;
+    const tmpl = condTemplates[condRot++ % condTemplates.length];
     questions.push({
       id: id(),
       type: "simple-lookup",
-      question: `What are the active conditions for patient ${patient.firstName} ${patient.lastName} (ID: ${patient.id})?`,
+      question: tmpl(pname, patient.id),
       answer: condNames.join("; "),
       patientIds: [patient.id],
       domain: "conditions",
@@ -100,10 +147,11 @@ export function generateSimpleLookup(
     condCount++;
   }
 
-  // 4. Primary care provider (~8 questions)
+  // 4. Primary care provider
   let pcpCount = 0;
+  let pcpRot = 0;
   for (const patient of sortedPatients) {
-    if (pcpCount >= 12) break;
+    if (pcpCount >= 40) break;
     const encs = ds.byPatient.encounters.get(patient.id);
     if (!encs) continue;
     const wellness = encs
@@ -114,10 +162,12 @@ export function generateSimpleLookup(
     const provider = ds.providerById.get(wellness[0].providerId);
     if (!provider) continue;
 
+    const pname = `${patient.firstName} ${patient.lastName}`;
+    const tmpl = pcpTemplates[pcpRot++ % pcpTemplates.length];
     questions.push({
       id: id(),
       type: "simple-lookup",
-      question: `Who is the most recent primary care provider for patient ${patient.firstName} ${patient.lastName} (ID: ${patient.id})?`,
+      question: tmpl(pname, patient.id),
       answer: `${provider.name} (${provider.specialty})`,
       patientIds: [patient.id],
       domain: "providers",
@@ -126,15 +176,17 @@ export function generateSimpleLookup(
     pcpCount++;
   }
 
-  // 5. Patient demographics (~8 questions)
+  // 5. Patient demographics
   let demoCount = 0;
+  let demoRot = 0;
   for (const patient of sortedPatients) {
-    if (demoCount >= 12) break;
-    const age = new Date().getFullYear() - new Date(patient.birthDate).getFullYear();
+    if (demoCount >= 40) break;
+    const pname = `${patient.firstName} ${patient.lastName}`;
+    const tmpl = demoTemplates[demoRot++ % demoTemplates.length];
     questions.push({
       id: id(),
       type: "simple-lookup",
-      question: `What are the demographics for patient ${patient.firstName} ${patient.lastName} (ID: ${patient.id})?`,
+      question: tmpl(pname, patient.id),
       answer: `Born ${patient.birthDate}, Gender: ${patient.gender}, Race: ${patient.race}, Ethnicity: ${patient.ethnicity}, Location: ${patient.city}, ${patient.state}`,
       patientIds: [patient.id],
       domain: "demographics",

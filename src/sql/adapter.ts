@@ -5,6 +5,15 @@
 
 import pg from 'pg';
 
+// Return DATE (1082) and TIMESTAMP/TIMESTAMPTZ (1114/1184) columns as strings.
+// Default pg parsers return JS Date objects at UTC-midnight, which then shift
+// by one day when rendered in a non-UTC timezone (EET shifted 2023-08-06 → 2023-08-05
+// in the SL-19 eval answer, against ground truth). Strings round-trip cleanly
+// and sort lexicographically since Synthea dates are ISO-formatted.
+pg.types.setTypeParser(1082, (v: string) => v);            // DATE
+pg.types.setTypeParser(1114, (v: string) => v);            // TIMESTAMP
+pg.types.setTypeParser(1184, (v: string) => v);            // TIMESTAMPTZ
+
 // Re-export the record types from the graph adapter for consistency
 export interface PatientRecord {
   patient_id: string; first_name: string; last_name: string;
@@ -28,6 +37,7 @@ export interface MedicationRecord {
 export interface ObservationRecord {
   observation_id: string; category: string; code: string;
   description: string; value: string; units: string;
+  value_canonical: number | null; units_canonical: string | null;
   type: string; date: string; encounter_id: string;
 }
 
@@ -92,7 +102,7 @@ export class SqlAdapter {
         `SELECT medication_id, code, description, start_date, stop_date, reason_code, reason_description, encounter_id
          FROM medication WHERE patient_id = $1`, [patientId]),
       this.pool.query(
-        `SELECT observation_id, category, code, description, value, units, type, date, encounter_id
+        `SELECT observation_id, category, code, description, value, units, value_canonical, units_canonical, type, date, encounter_id
          FROM observation WHERE patient_id = $1`, [patientId]),
       this.pool.query(
         `SELECT procedure_id, code, system, description, start_date, stop_date, reason_code, reason_description, encounter_id
@@ -123,7 +133,7 @@ export class SqlAdapter {
     const filters = ['patient_id = $1'];
 
     if (opts?.active) {
-      filters.push('(stop_date IS NULL OR stop_date = \'\')');
+      filters.push('stop_date IS NULL');
     }
     if (opts?.name) {
       params.push(`%${opts.name}%`);
@@ -150,9 +160,9 @@ export class SqlAdapter {
     const filters = ['patient_id = $1'];
 
     if (opts?.status === 'active') {
-      filters.push('(stop_date IS NULL OR stop_date = \'\')');
+      filters.push('stop_date IS NULL');
     } else if (opts?.status === 'resolved') {
-      filters.push('stop_date IS NOT NULL AND stop_date <> \'\'');
+      filters.push('stop_date IS NOT NULL');
     }
 
     const { rows } = await this.pool.query(
@@ -187,7 +197,7 @@ export class SqlAdapter {
     }
 
     const { rows } = await this.pool.query(
-      `SELECT observation_id, category, code, description, value, units, type, date, encounter_id
+      `SELECT observation_id, category, code, description, value, units, value_canonical, units_canonical, type, date, encounter_id
        FROM observation WHERE ${filters.join(' AND ')}
        ORDER BY date DESC`,
       params,
@@ -274,6 +284,14 @@ export class SqlAdapter {
       filters.push(`p.gender = $${params.length}`);
     }
 
+    // age_years is indexed and precomputed at ingest — filter in SQL, not JS.
+    if (opts.ageRange) {
+      params.push(opts.ageRange[0]);
+      filters.push(`p.age_years >= $${params.length}`);
+      params.push(opts.ageRange[1]);
+      filters.push(`p.age_years <= $${params.length}`);
+    }
+
     const whereClause = filters.length > 0 ? 'WHERE ' + filters.join(' AND ') : '';
 
     const { rows } = await this.pool.query(
@@ -287,18 +305,6 @@ export class SqlAdapter {
       params,
     );
 
-    let results: PatientRecord[] = rows;
-
-    // Age filter (post-query)
-    if (opts.ageRange) {
-      const now = new Date();
-      results = results.filter((p) => {
-        const birth = new Date(p.birth_date);
-        const age = (now.getTime() - birth.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-        return age >= opts.ageRange![0] && age <= opts.ageRange![1];
-      });
-    }
-
-    return results;
+    return rows;
   }
 }

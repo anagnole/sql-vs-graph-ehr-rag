@@ -14,28 +14,21 @@ export function generateMultiHop(
   const questions: GroundTruthQuestion[] = [];
   const sortedPatients = [...ds.patients].sort((a, b) => a.id.localeCompare(b.id));
 
-  // 1. Medications prescribed at the encounter where condition X was diagnosed (~10)
+  // 1. Medications prescribed at the encounter where condition X was diagnosed
   const targetConditions = [
-    "Diabetes",
-    "Hypertension",
-    "Prediabetes",
-    "Anemia",
-    "Hyperlipidemia",
-    "Osteoarthritis",
-    "Chronic kidney disease",
-    "Atrial Fibrillation",
-    "Asthma",
-    "Depression",
+    "Diabetes", "Hypertension", "Prediabetes", "Anemia",
+    "Hyperlipidemia", "Osteoarthritis", "Chronic kidney disease",
+    "Atrial Fibrillation", "Asthma", "Depression",
   ];
 
   let q1Count = 0;
   for (const patient of sortedPatients) {
-    if (q1Count >= 14) break;
+    if (q1Count >= 40) break;
     const conds = ds.byPatient.conditions.get(patient.id);
     if (!conds) continue;
 
     for (const targetCond of targetConditions) {
-      if (q1Count >= 14) break;
+      if (q1Count >= 40) break;
       const cond = conds.find((c) =>
         c.description.toLowerCase().includes(targetCond.toLowerCase())
       );
@@ -44,7 +37,7 @@ export function generateMultiHop(
       const encMeds = ds.byEncounter.medications.get(cond.encounterId);
       if (!encMeds || encMeds.length === 0) continue;
 
-      const medNames = encMeds.map((m) => m.description).sort();
+      const medNames = [...new Set(encMeds.map((m) => m.description))].sort();
       questions.push({
         id: id(),
         type: "multi-hop",
@@ -55,14 +48,14 @@ export function generateMultiHop(
         supportingRecordIds: [cond.id, ...encMeds.map((m) => m.id)],
       });
       q1Count++;
-      break;
+      break; // one per patient for this category
     }
   }
 
-  // 2. Procedures at most recent emergency visit (~10)
+  // 2. Procedures at most recent emergency visit
   let q2Count = 0;
   for (const patient of sortedPatients) {
-    if (q2Count >= 14) break;
+    if (q2Count >= 40) break;
     const encs = ds.byPatient.encounters.get(patient.id);
     if (!encs) continue;
     const emergency = encs
@@ -73,7 +66,7 @@ export function generateMultiHop(
     const procs = ds.byEncounter.procedures.get(emergency[0].id);
     if (!procs || procs.length === 0) continue;
 
-    const procNames = procs.map((p) => p.description).sort();
+    const procNames = [...new Set(procs.map((p) => p.description))].sort();
     questions.push({
       id: id(),
       type: "multi-hop",
@@ -86,28 +79,21 @@ export function generateMultiHop(
     q2Count++;
   }
 
-  // 3. Lab value at encounter where medication was first prescribed (~10)
+  // 3. Lab value at encounter where medication was first prescribed
   const targetMeds = [
-    "Metformin",
-    "Lisinopril",
-    "Atorvastatin",
-    "Amlodipine",
-    "Hydrochlorothiazide",
-    "Simvastatin",
-    "Losartan",
-    "Omeprazole",
-    "Insulin",
-    "Warfarin",
+    "Metformin", "Lisinopril", "Atorvastatin", "Amlodipine",
+    "Hydrochlorothiazide", "Simvastatin", "Losartan",
+    "Omeprazole", "Insulin", "Warfarin",
   ];
 
   let q3Count = 0;
   for (const patient of sortedPatients) {
-    if (q3Count >= 14) break;
+    if (q3Count >= 40) break;
     const meds = ds.byPatient.medications.get(patient.id);
     if (!meds) continue;
 
     for (const targetMed of targetMeds) {
-      if (q3Count >= 14) break;
+      if (q3Count >= 40) break;
       const matchingMeds = meds
         .filter((m) => m.description.toLowerCase().includes(targetMed.toLowerCase()))
         .sort((a, b) => a.startDate.localeCompare(b.startDate));
@@ -119,7 +105,6 @@ export function generateMultiHop(
       const numericObs = encObs.filter((o) => o.type === "numeric");
       if (numericObs.length === 0) continue;
 
-      // Pick the most clinically relevant observation
       const obs = numericObs[0];
       questions.push({
         id: id(),
@@ -135,15 +120,15 @@ export function generateMultiHop(
     }
   }
 
-  // 4. Provider who diagnosed a specific condition (~10)
+  // 4. Provider who diagnosed a specific condition
   let q4Count = 0;
   for (const patient of sortedPatients) {
-    if (q4Count >= 14) break;
+    if (q4Count >= 40) break;
     const conds = ds.byPatient.conditions.get(patient.id);
     if (!conds) continue;
 
     for (const cond of conds) {
-      if (q4Count >= 14) break;
+      if (q4Count >= 40) break;
       const encounter = ds.encounterById.get(cond.encounterId);
       if (!encounter) continue;
       const provider = ds.providerById.get(encounter.providerId);

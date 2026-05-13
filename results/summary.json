@@ -2,29 +2,38 @@
   "summaries": [
     {
       "system": "graph",
-      "overall": 0.556,
+      "overall": 0.364,
       "byType": {
-        "simple-lookup": 0.556,
+        "simple-lookup": 0,
         "multi-hop": 0,
-        "temporal": 0,
+        "temporal": 0.364,
         "cohort": 0,
-        "reasoning": 0
+        "reasoning": 0,
+        "unanswerable": 0
       },
       "byDomain": {
-        "cardiovascular": 0.667,
-        "conditions": 1,
-        "demographics": 0,
-        "diabetes": 0,
+        "cardiovascular": 0,
+        "conditions": 0,
+        "diabetes": 0.364,
+        "general": 0,
         "medications": 0,
-        "providers": 0,
         "renal": 0,
+        "demographics": 0,
+        "providers": 0,
+        "guidelines": 0,
+        "respiratory": 0,
         "labs": 0,
         "procedures": 0,
-        "general": 0,
-        "guidelines": 0
+        "absent-condition": 0,
+        "missing-data-type": 0,
+        "non-existent-patient": 0,
+        "speculative": 0,
+        "subjective": 0,
+        "unanswerable-medical": 0,
+        "unanswerable-non-medical": 0
       },
-      "avgLatencyMs": 49405,
-      "errorCount": 0
+      "avgLatencyMs": 6635,
+      "errorCount": 2
     },
     {
       "system": "sql",
@@ -34,20 +43,29 @@
         "multi-hop": 0,
         "temporal": 0,
         "cohort": 0,
-        "reasoning": 0
+        "reasoning": 0,
+        "unanswerable": 0
       },
       "byDomain": {
         "cardiovascular": 0,
         "conditions": 0,
-        "demographics": 0,
         "diabetes": 0,
+        "general": 0,
         "medications": 0,
-        "providers": 0,
         "renal": 0,
+        "demographics": 0,
+        "providers": 0,
+        "guidelines": 0,
+        "respiratory": 0,
         "labs": 0,
         "procedures": 0,
-        "general": 0,
-        "guidelines": 0
+        "absent-condition": 0,
+        "missing-data-type": 0,
+        "non-existent-patient": 0,
+        "speculative": 0,
+        "subjective": 0,
+        "unanswerable-medical": 0,
+        "unanswerable-non-medical": 0
       },
       "avgLatencyMs": 0,
       "errorCount": 0
@@ -60,20 +78,29 @@
         "multi-hop": 0,
         "temporal": 0,
         "cohort": 0,
-        "reasoning": 0
+        "reasoning": 0,
+        "unanswerable": 0
       },
       "byDomain": {
         "cardiovascular": 0,
         "conditions": 0,
-        "demographics": 0,
         "diabetes": 0,
+        "general": 0,
         "medications": 0,
-        "providers": 0,
         "renal": 0,
+        "demographics": 0,
+        "providers": 0,
+        "guidelines": 0,
+        "respiratory": 0,
         "labs": 0,
         "procedures": 0,
-        "general": 0,
-        "guidelines": 0
+        "absent-condition": 0,
+        "missing-data-type": 0,
+        "non-existent-patient": 0,
+        "speculative": 0,
+        "subjective": 0,
+        "unanswerable-medical": 0,
+        "unanswerable-non-medical": 0
       },
       "avgLatencyMs": 0,
       "errorCount": 0
@@ -86,20 +113,29 @@
         "multi-hop": 0,
         "temporal": 0,
         "cohort": 0,
-        "reasoning": 0
+        "reasoning": 0,
+        "unanswerable": 0
       },
       "byDomain": {
         "cardiovascular": 0,
         "conditions": 0,
-        "demographics": 0,
         "diabetes": 0,
+        "general": 0,
         "medications": 0,
-        "providers": 0,
         "renal": 0,
+        "demographics": 0,
+        "providers": 0,
+        "guidelines": 0,
+        "respiratory": 0,
         "labs": 0,
         "procedures": 0,
-        "general": 0,
-        "guidelines": 0
+        "absent-condition": 0,
+        "missing-data-type": 0,
+        "non-existent-patient": 0,
+        "speculative": 0,
+        "subjective": 0,
+        "unanswerable-medical": 0,
+        "unanswerable-non-medical": 0
       },
       "avgLatencyMs": 0,
       "errorCount": 0
@@ -107,34 +143,50 @@
   ],
   "results": [
     {
-      "questionId": "SL-10",
+      "questionId": "TMP-17",
       "system": "graph",
       "model": "qwen2.5:32b",
-      "answer": "134.5 mg/dL on 2024-09-24",
-      "latencyMs": 24140,
-      "score": 0.6666666666666666,
-      "scoreMethod": "fuzzy",
-      "groundTruth": "134.5 mg/dL (recorded 2024-09-24)"
-    },
-    {
-      "questionId": "SL-29",
-      "system": "graph",
-      "model": "qwen2.5:32b",
-      "answer": "- Medication review due\n- Educated to high school level\n- Full-time employment\n- Prediabetes\n- Anemia\n- Loss of teeth\n- Ischemic heart disease\n- Abnormal findings diagnostic imaging heart+coronary circulat\n- History of coronary artery bypass grafting",
-      "latencyMs": 16186,
-      "score": 1,
-      "scoreMethod": "f1",
-      "groundTruth": "Abnormal findings diagnostic imaging heart+coronary circulat (finding); Anemia (disorder); Educated to high school level (finding); Full-time employment (finding); History of coronary artery bypass grafting (situation); Ischemic heart disease (disorder); Loss of teeth (disorder); Medication review due (situation); Prediabetes (finding)"
-    },
-    {
-      "questionId": "SL-53",
-      "system": "graph",
-      "model": "qwen2.5:32b",
-      "answer": "The provided data is a comprehensive medical record of a patient, including details about their recent lab results, medications, and conditions. Here’s a summary:\n\n### Patient Information:\n- **Patient ID:** Not explicitly given in the text.\n- **Date of Death:** June 18, 2021.\n\n### Recent Lab Results:\n1. **Cause of Death:** Ischemic heart disease (disorder).\n2. **Left Ventricular Ejection Fraction (LVEF):** 45.2%\n3. **Magnesium [Mass/volume] in Serum or Plasma:** 2.2 mg/dL\n4. **Carbon Dioxide [Partial pressure] in Venous Blood:** 47.5 mm[Hg]\n5. **pH of Venous and Arterial Blood:**\n   - Venous pH: 7.4\n   - Arterial pH (earlier): 6.9, then corrected to 7.0.\n6. **Activated Clotting Time (ACT) of Blood:** 115.9 s\n7. **Creatinine [Mass/volume] in Serum or Plasma:** 2.8 mg/dL\n8. **Prothrombin Time (PT):** 10.5 s, INR: 1.0\n9. **Cholesterol Levels:**\n   - Total Cholesterol: 169.2 mg/dL\n   - Triglycerides: 143.4 mg/dL\n   - LDL-Cholesterol: 84.4 mg/dL\n   - HDL-Cholesterol: 56.1 mg/dL\n\n### Medications:\n- **Active:** \n  - Ferrous sulfate 325 MG Oral Tablet (for treating iron deficiency anemia)\n  - Clopidogrel bisulfate, atorvastatin, and others for managing cardiovascular conditions.\n  \n- **Administered During Procedure:**\n  - Propofol 10 MG/ML Injection\n  - Midazolam 1 MG/ML Injectable Solution\n  - Ondansetron 2 MG/ML Injection\n\n### Conditions:\n- **Ischemic Heart Disease:** Underlying condition leading to death.\n- **Hemoglobin and Iron Deficiency:** Managed with oral iron supplements.\n\n### Recent Procedures:\n- **Coronary Artery Bypass Graft (CABG) Surgery:**\n  - CABG Grafts: 2\n  - CABG Arterial Conduits: 4\n\nThis data indicates the patient underwent critical cardiovascular interventions, including a bypass surgery and had ongoing issues with heart function as evidenced by their low ejection fraction. The lab results reflect typical monitoring during such procedures, with emphasis on blood gases, electrolytes, and clotting factors.",
-      "latencyMs": 107889,
+      "answer": "",
+      "latencyMs": 0,
+      "error": "Timeout after 90000ms",
       "score": 0,
+      "scoreMethod": "error",
+      "groundTruth": "stable trend. Values: 2017-07-19: 118.0 mm[Hg], 2019-05-01: 124.0 mm[Hg], 2022-02-16: 118.0 mm[Hg], 2024-02-21: 123.0 mm[Hg], 2026-02-25: 124.0 mm[Hg]"
+    },
+    {
+      "questionId": "TMP-65",
+      "system": "graph",
+      "model": "qwen2.5:32b",
+      "answer": "",
+      "latencyMs": 0,
+      "error": "Timeout after 90000ms",
+      "score": 0,
+      "scoreMethod": "error",
+      "groundTruth": "2019-05-01"
+    },
+    {
+      "questionId": "TMP-1",
+      "system": "graph",
+      "model": "qwen2.5:32b",
+      "answer": "HbA1c increased from 5.8% to 6.9% over 2492 days, rising by 1.1%.",
+      "latencyMs": 19904,
+      "breakdown": {
+        "totalMs": 19904,
+        "kuzuMs": 4,
+        "kuzuCalls": 1,
+        "lockWaitMs": 0,
+        "toolMs": 5,
+        "toolCalls": 1,
+        "perTool": {
+          "compare_observations": {
+            "ms": 5,
+            "calls": 1
+          }
+        }
+      },
+      "score": 0.36363636363636365,
       "scoreMethod": "fuzzy",
-      "groundTruth": "Born 1954-02-12, Gender: F, Race: black, Ethnicity: nonhispanic, Location: Everett, Massachusetts"
+      "groundTruth": "increasing trend. Values: 2019-05-01: 5.8 %, 2022-02-16: 6.9 %, 2024-02-21: 6.9 %, 2026-02-25: 6.9 %"
     }
   ]
 }

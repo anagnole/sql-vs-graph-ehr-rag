@@ -1,9 +1,31 @@
 import type { ParsedDataset } from "../parser/types.js";
-import type { DataProfile, GroundTruthQuestion } from "./types.js";
+import { type DataProfile, type GroundTruthQuestion, isPlausibleValue, normalizeUnits } from "./types.js";
 
 let counter = 0;
 function id() {
   return `TMP-${++counter}`;
+}
+
+/**
+ * Classify trend using linear regression slope rather than just first-vs-last.
+ * Returns "increasing", "decreasing", or "stable" based on normalized slope.
+ */
+function classifyTrend(values: number[]): "increasing" | "decreasing" | "stable" {
+  const n = values.length;
+  if (n < 2) return "stable";
+  const xMean = (n - 1) / 2;
+  const yMean = values.reduce((s, v) => s + v, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i++) {
+    num += (i - xMean) * (values[i] - yMean);
+    den += (i - xMean) ** 2;
+  }
+  const slope = den === 0 ? 0 : num / den;
+  const relSlope = yMean === 0 ? 0 : slope / Math.abs(yMean);
+  if (relSlope > 0.03) return "increasing";
+  if (relSlope < -0.03) return "decreasing";
+  return "stable";
 }
 
 export function generateTemporal(
@@ -12,10 +34,9 @@ export function generateTemporal(
 ): GroundTruthQuestion[] {
   counter = 0;
   const questions: GroundTruthQuestion[] = [];
-  // Reverse sort to draw from different patients than simple-lookup and multi-hop
-  const sortedPatients = [...ds.patients].sort((a, b) => b.id.localeCompare(a.id));
+  const sortedPatients = [...ds.patients].sort((a, b) => a.id.localeCompare(b.id));
 
-  // 1. Lab value trend over time (~12)
+  // 1. Lab value trend over time — per patient per lab code
   const trendLabs = [
     { code: "4548-4", name: "Hemoglobin A1c", domain: "diabetes" },
     { code: "2160-0", name: "Creatinine", domain: "renal" },
@@ -27,12 +48,10 @@ export function generateTemporal(
     { code: "39156-5", name: "Body Mass Index", domain: "general" },
   ];
 
-  let q1Count = 0;
   for (const lab of trendLabs) {
-    if (q1Count >= 12) break;
     let perLabCount = 0;
     for (const patient of sortedPatients) {
-      if (perLabCount >= 2 || q1Count >= 12) break;
+      if (perLabCount >= 8) break;
       const obs = ds.byPatient.observations.get(patient.id);
       if (!obs) continue;
       const matching = obs
@@ -40,12 +59,17 @@ export function generateTemporal(
         .sort((a, b) => a.date.localeCompare(b.date));
       if (matching.length < 3) continue;
 
-      // Take last 5 values (or all if fewer)
       const recent = matching.slice(-5);
-      const trendData = recent.map((o) => `${o.date.slice(0, 10)}: ${o.value} ${o.units}`);
-      const firstVal = parseFloat(recent[0].value);
-      const lastVal = parseFloat(recent[recent.length - 1].value);
-      const trend = lastVal > firstVal * 1.05 ? "increasing" : lastVal < firstVal * 0.95 ? "decreasing" : "stable";
+      // Skip if any value is clinically implausible
+      if (recent.some((o) => !isPlausibleValue(lab.code, o.value))) continue;
+      const values = recent.map((o) => parseFloat(o.value));
+      // Skip series with outliers (>3x or <0.3x the median)
+      const sortedVals = [...values].sort((a, b) => a - b);
+      const median = sortedVals[Math.floor(sortedVals.length / 2)];
+      if (median > 0 && values.some((v) => v > median * 3 || v < median * 0.3)) continue;
+
+      const trendData = recent.map((o) => `${o.date.slice(0, 10)}: ${o.value} ${normalizeUnits(lab.code, o.units)}`);
+      const trend = classifyTrend(values);
 
       questions.push({
         id: id(),
@@ -56,29 +80,21 @@ export function generateTemporal(
         domain: lab.domain,
         supportingRecordIds: recent.map((o) => o.id),
       });
-      q1Count++;
       perLabCount++;
     }
   }
 
-  // 2. First diagnosis date for a condition (~12)
+  // 2. First diagnosis date for a condition
   const condTargets = [
-    "Diabetes",
-    "Hypertension",
-    "Prediabetes",
-    "Hyperlipidemia",
-    "Osteoarthritis",
-    "Chronic kidney disease",
-    "Asthma",
-    "Atrial Fibrillation",
+    "Diabetes", "Hypertension", "Prediabetes", "Hyperlipidemia",
+    "Osteoarthritis", "Chronic kidney disease", "Asthma", "Atrial Fibrillation",
+    "Anemia", "Depression",
   ];
 
-  let q2Count = 0;
   for (const condName of condTargets) {
-    if (q2Count >= 12) break;
     let perCondCount = 0;
     for (const patient of sortedPatients) {
-      if (perCondCount >= 2 || q2Count >= 12) break;
+      if (perCondCount >= 8) break;
       const conds = ds.byPatient.conditions.get(patient.id);
       if (!conds) continue;
       const matching = conds
@@ -95,21 +111,24 @@ export function generateTemporal(
         domain: "conditions",
         supportingRecordIds: [matching[0].id],
       });
-      q2Count++;
       perCondCount++;
     }
   }
 
-  // 3. Medication duration (~12)
+  // 3. Medication duration (>= 7 days only)
   let q3Count = 0;
   for (const patient of sortedPatients) {
-    if (q3Count >= 12) break;
+    if (q3Count >= 40) break;
     const meds = ds.byPatient.medications.get(patient.id);
     if (!meds) continue;
     const stopped = meds.filter((m) => m.stopDate).sort((a, b) => a.description.localeCompare(b.description));
-    if (stopped.length === 0) continue;
 
-    const med = stopped[0];
+    const med = stopped.find((m) => {
+      const days = Math.round((new Date(m.stopDate!).getTime() - new Date(m.startDate).getTime()) / (1000 * 60 * 60 * 24));
+      return days >= 7;
+    });
+    if (!med) continue;
+
     const start = new Date(med.startDate);
     const stop = new Date(med.stopDate!);
     const days = Math.round((stop.getTime() - start.getTime()) / (1000 * 60 * 60 * 24));
@@ -126,16 +145,16 @@ export function generateTemporal(
     q3Count++;
   }
 
-  // 4. Medications started within 6 months of a diagnosis (~12)
+  // 4. Medications started within 6 months of a diagnosis
   let q4Count = 0;
   for (const patient of sortedPatients) {
-    if (q4Count >= 12) break;
+    if (q4Count >= 40) break;
     const conds = ds.byPatient.conditions.get(patient.id);
     const meds = ds.byPatient.medications.get(patient.id);
     if (!conds || !meds) continue;
 
     for (const cond of conds) {
-      if (q4Count >= 12) break;
+      if (q4Count >= 40) break;
       const diagDate = new Date(cond.startDate);
       const sixMonthsLater = new Date(diagDate);
       sixMonthsLater.setMonth(sixMonthsLater.getMonth() + 6);
@@ -162,10 +181,10 @@ export function generateTemporal(
     }
   }
 
-  // 5. Chronological condition ordering (~12)
+  // 5. Chronological condition ordering
   let q5Count = 0;
   for (const patient of sortedPatients) {
-    if (q5Count >= 12) break;
+    if (q5Count >= 40) break;
     const conds = ds.byPatient.conditions.get(patient.id);
     if (!conds) continue;
     const uniqueConds = new Map<string, typeof conds[0]>();

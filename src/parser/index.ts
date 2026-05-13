@@ -161,7 +161,7 @@ function buildIdMap<T extends { id: string }>(items: T[]): Map<string, T> {
   return map;
 }
 
-export function parseSyntheaData(dataDir: string): ParsedDataset {
+export async function parseSyntheaData(dataDir: string): Promise<ParsedDataset> {
   // Reset counters
   condCounter = 0;
   medCounter = 0;
@@ -169,14 +169,22 @@ export function parseSyntheaData(dataDir: string): ParsedDataset {
   procCounter = 0;
 
   console.log("Reading CSVs...");
-  const patients = readCsv<RawPatient>(join(dataDir, "patients.csv")).map(mapPatient);
-  const encounters = readCsv<RawEncounter>(join(dataDir, "encounters.csv")).map(mapEncounter);
-  const conditions = readCsv<RawCondition>(join(dataDir, "conditions.csv")).map(mapCondition);
-  const medications = readCsv<RawMedication>(join(dataDir, "medications.csv")).map(mapMedication);
-  const observations = readCsv<RawObservation>(join(dataDir, "observations.csv")).map(mapObservation);
-  const procedures = readCsv<RawProcedure>(join(dataDir, "procedures.csv")).map(mapProcedure);
-  const providers = readCsv<RawProvider>(join(dataDir, "providers.csv")).map(mapProvider);
-  const organizations = readCsv<RawOrganization>(join(dataDir, "organizations.csv")).map(mapOrganization);
+  const patients = (await readCsv<RawPatient>(join(dataDir, "patients.csv"))).map(mapPatient);
+  console.log(`  ✓ patients (${patients.length})`);
+  const encounters = (await readCsv<RawEncounter>(join(dataDir, "encounters.csv"))).map(mapEncounter);
+  console.log(`  ✓ encounters (${encounters.length})`);
+  const conditions = (await readCsv<RawCondition>(join(dataDir, "conditions.csv"))).map(mapCondition);
+  console.log(`  ✓ conditions (${conditions.length})`);
+  const medications = (await readCsv<RawMedication>(join(dataDir, "medications.csv"))).map(mapMedication);
+  console.log(`  ✓ medications (${medications.length})`);
+  const observations = (await readCsv<RawObservation>(join(dataDir, "observations.csv"))).map(mapObservation);
+  console.log(`  ✓ observations (${observations.length})`);
+  const procedures = (await readCsv<RawProcedure>(join(dataDir, "procedures.csv"))).map(mapProcedure);
+  console.log(`  ✓ procedures (${procedures.length})`);
+  const providers = (await readCsv<RawProvider>(join(dataDir, "providers.csv"))).map(mapProvider);
+  console.log(`  ✓ providers (${providers.length})`);
+  const organizations = (await readCsv<RawOrganization>(join(dataDir, "organizations.csv"))).map(mapOrganization);
+  console.log(`  ✓ organizations (${organizations.length})`);
 
   console.log(
     `Parsed: ${patients.length} patients, ${encounters.length} encounters, ` +

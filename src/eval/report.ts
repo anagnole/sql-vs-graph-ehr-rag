@@ -16,7 +16,8 @@ export function generateReport(
   mkdirSync(RESULTS_DIR, { recursive: true });
 
   const systems = ['graph', 'sql', 'sql-fts', 'llm-only'] as const;
-  const types = ['simple-lookup', 'multi-hop', 'temporal', 'cohort', 'reasoning'] as const;
+  const types = ['simple-lookup', 'multi-hop', 'temporal', 'cohort', 'reasoning', 'unanswerable'] as const;
+  const hasJudgeScores = results.some(r => r.judgeScore != null && r.judgeScore >= 0);
 
   // ─── Build summaries ─────────────────────────────────────────────────
 
@@ -96,10 +97,18 @@ export function generateReport(
 
   // ─── per-question.csv ────────────────────────────────────────────────
 
-  const csvLines = ['question_id,type,domain,system,score,score_method,latency_ms,error'];
+  const csvHeader = [
+    'question_id', 'type', 'domain', 'system', 'score', 'score_method',
+    'latency_ms', 'kuzu_ms', 'kuzu_calls', 'lock_wait_ms', 'tool_ms', 'tool_calls',
+    'llm_reported_ms', 'num_turns', 'cost_usd',
+    ...(hasJudgeScores ? ['judge_score', 'judge_rationale'] : []),
+    'error',
+  ];
+  const csvLines = [csvHeader.join(',')];
   for (const r of results) {
     const q = questions.find(q => q.id === r.questionId);
-    csvLines.push([
+    const b = r.breakdown;
+    const row = [
       r.questionId,
       q?.type ?? '',
       q?.domain ?? '',
@@ -107,8 +116,21 @@ export function generateReport(
       r.score.toFixed(3),
       r.scoreMethod,
       r.latencyMs,
-      r.error ?? '',
-    ].join(','));
+      b?.kuzuMs ?? '',
+      b?.kuzuCalls ?? '',
+      b?.lockWaitMs ?? '',
+      b?.toolMs ?? '',
+      b?.toolCalls ?? '',
+      b?.llmReportedMs ?? '',
+      b?.numTurns ?? '',
+      b?.costUsd != null ? b.costUsd.toFixed(6) : '',
+      ...(hasJudgeScores ? [
+        r.judgeScore != null ? r.judgeScore.toFixed(3) : '',
+        r.judgeRationale ? `"${r.judgeRationale.replace(/"/g, '""')}"` : '',
+      ] : []),
+      r.error ? `"${r.error.replace(/"/g, '""')}"` : '',
+    ];
+    csvLines.push(row.join(','));
   }
   writeFileSync(join(RESULTS_DIR, 'per-question.csv'), csvLines.join('\n'));
 

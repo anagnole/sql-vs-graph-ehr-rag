@@ -5,6 +5,8 @@ import { generateMultiHop } from "./multi-hop.js";
 import { generateTemporal } from "./temporal.js";
 import { generateCohort } from "./cohort.js";
 import { generateReasoning } from "./reasoning.js";
+import { generateNegation } from "./negation.js";
+import { generateUnanswerable } from "./unanswerable.js";
 
 export function profileDataset(ds: ParsedDataset): DataProfile {
   const conditionCounts = new Map<string, number>();
@@ -101,6 +103,14 @@ export function generateAllQuestions(
   const reasoning = generateReasoning(ds, profile);
   console.log(`  reasoning: ${reasoning.length} candidates`);
   all.push(...reasoning);
+
+  const negation = generateNegation(ds, profile);
+  console.log(`  negation: ${negation.length} candidates`);
+  all.push(...negation);
+
+  const unanswerable = generateUnanswerable(ds, profile);
+  console.log(`  unanswerable: ${unanswerable.length} candidates`);
+  all.push(...unanswerable);
 
   console.log(`Total candidates: ${all.length}`);
   return all;

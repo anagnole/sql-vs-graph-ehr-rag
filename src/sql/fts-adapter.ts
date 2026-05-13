@@ -78,6 +78,14 @@ export class SqlFtsAdapter extends SqlAdapter {
       filters.push(`p.gender = $${params.length}`);
     }
 
+    // age_years is indexed and precomputed at ingest — filter in SQL.
+    if (opts.ageRange) {
+      params.push(opts.ageRange[0]);
+      filters.push(`p.age_years >= $${params.length}`);
+      params.push(opts.ageRange[1]);
+      filters.push(`p.age_years <= $${params.length}`);
+    }
+
     const whereClause = filters.length > 0 ? 'WHERE ' + filters.join(' AND ') : '';
 
     const { rows } = await this.ftsPool.query(
@@ -91,17 +99,6 @@ export class SqlFtsAdapter extends SqlAdapter {
       params,
     );
 
-    let results: PatientRecord[] = rows;
-
-    if (opts.ageRange) {
-      const now = new Date();
-      results = results.filter((p) => {
-        const birth = new Date(p.birth_date);
-        const age = (now.getTime() - birth.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
-        return age >= opts.ageRange![0] && age <= opts.ageRange![1];
-      });
-    }
-
-    return results;
+    return rows;
   }
 }

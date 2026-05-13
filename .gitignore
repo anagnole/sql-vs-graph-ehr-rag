@@ -29,3 +29,15 @@ AGENTS.md
 CLAUDE.md
 data/documents
 data/synthea
+
+# Eval intermediates (chunks fed to judge sub-agents, sidecars they wrote
+# back, Synthea generator + raw FHIR output — all recreatable)
+tools/
+scratch/
+
+# Old result-file backups created during retry runs
+results/*.bak-*.json
+results/*.backup-*.json
+
+# Python venv for the analysis scripts
+.venv-analysis/

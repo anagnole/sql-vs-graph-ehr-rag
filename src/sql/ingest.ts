@@ -6,7 +6,7 @@
  */
 
 import pg from 'pg';
-import { createReadStream, readFileSync } from 'node:fs';
+import { createReadStream, readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
@@ -16,6 +16,32 @@ import type {
   Patient, Encounter, Condition, Medication,
   Observation, Procedure, Provider, Organization,
 } from '../parser/types.js';
+import { normalizeObservation, LOINC_SPECS } from '../clinical/loinc-normalization.js';
+
+// Synthea emits a mix of "2017-09-23" (bare date) and "2017-09-23T14:47:33Z"
+// (ISO datetime). Postgres DATE columns only accept the bare form, so truncate
+// anything with a 'T' separator. Empty/null passes through as null.
+function toDateOrNull(val: unknown): string | null {
+  if (val === null || val === undefined) return null;
+  const s = String(val);
+  if (!s) return null;
+  const tIdx = s.indexOf('T');
+  return tIdx > 0 ? s.slice(0, tIdx) : s;
+}
+
+// Calendar-correct age calculation (matches the Kuzu-side ingest helper).
+// Returns null if birthIso is empty/invalid.
+function yearsBetween(birthIso: string | null, asOfIso: string): number | null {
+  if (!birthIso) return null;
+  const b = new Date(birthIso);
+  const a = new Date(asOfIso);
+  if (Number.isNaN(b.getTime()) || Number.isNaN(a.getTime())) return null;
+  let years = a.getUTCFullYear() - b.getUTCFullYear();
+  const monthDiff = a.getUTCMonth() - b.getUTCMonth();
+  const dayDiff = a.getUTCDate() - b.getUTCDate();
+  if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) years--;
+  return years;
+}
 
 const require = createRequire(import.meta.url);
 const { parser } = require('stream-json');
@@ -24,7 +50,36 @@ const { streamObject } = require('stream-json/streamers/StreamObject');
 const PROJECT_ROOT = join(import.meta.dirname, '../..');
 const GEN_DIR = join(PROJECT_ROOT, 'data', 'generated');
 
-const PG_DSN = process.env.PG_DSN ?? 'postgresql://user@localhost:5432/ehrdb';
+// CLI: --tier <name> selects a tier-specific patient subset and database.
+const argv = process.argv.slice(2);
+const tierFlag = (() => {
+  const i = argv.indexOf('--tier');
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+})();
+
+// Load patient allowlist if tier specified — patients not in this set are skipped.
+const tierAllowlist: Set<string> | null = (() => {
+  if (!tierFlag) return null;
+  const tierFile = join(GEN_DIR, `tier-${tierFlag}.json`);
+  if (!existsSync(tierFile)) {
+    console.error(`Tier file not found: ${tierFile}`);
+    process.exit(1);
+  }
+  const ids: string[] = JSON.parse(readFileSync(tierFile, 'utf-8'));
+  return new Set(ids);
+})();
+
+const PG_DSN = process.env.PG_DSN ?? (
+  tierFlag
+    ? `postgresql://user@localhost:5432/ehrdb-${tierFlag}`
+    : 'postgresql://user@localhost:5432/ehrdb'
+);
+
+if (tierFlag) {
+  console.log(`Tier mode: --tier ${tierFlag}`);
+  console.log(`  Database: ${PG_DSN}`);
+  console.log(`  Allowlist: ${tierAllowlist!.size} patients`);
+}
 
 // ─── Batch inserter ──────────────────────────────────────────────────────────
 
@@ -96,6 +151,7 @@ async function ingest() {
     // Drop existing tables and recreate
     console.log('Creating schema (with FTS)...');
     await pool.query(`
+      DROP TABLE IF EXISTS observation_reference_range CASCADE;
       DROP TABLE IF EXISTS procedure_ CASCADE;
       DROP TABLE IF EXISTS observation CASCADE;
       DROP TABLE IF EXISTS medication CASCADE;
@@ -106,6 +162,36 @@ async function ingest() {
       DROP TABLE IF EXISTS organization CASCADE;
     `);
     await createSchema(pool, true);
+
+    // Reference-range table: one row per curated LOINC code. Loaded first so
+    // observation rows don't depend on it (it's a lookup, not an FK).
+    console.log('Loading observation reference ranges...');
+    let refRangeCount = 0;
+    for (const spec of LOINC_SPECS) {
+      const range = spec.range;
+      await pool.query(
+        `INSERT INTO observation_reference_range
+           (code, canonical_unit, normal_low, normal_high, critical_low, critical_high, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (code) DO NOTHING`,
+        [
+          spec.code,
+          spec.conversion.canonicalUnit,
+          range?.normalLow ?? null,
+          range?.normalHigh ?? null,
+          range?.criticalLow ?? null,
+          range?.criticalHigh ?? null,
+          range?.source ?? null,
+        ],
+      );
+      refRangeCount++;
+    }
+    console.log(`  Reference ranges: ${refRangeCount} LOINC codes`);
+
+    // age_years computed as of the ingest date (or at death if the patient died
+    // before then). Stored once; re-ingest is the refresh mechanism, same as
+    // the Kuzu side.
+    const ingestDateIso = new Date().toISOString().slice(0, 10);
 
     const batch = new BatchInserter(pool, 500);
 
@@ -157,9 +243,16 @@ async function ingest() {
           };
 
           const pat = entry.patient;
+          if (tierAllowlist && !tierAllowlist.has(pat.id)) { callback(); return; }
+          const birthDate = toDateOrNull(pat.birthDate);
+          const deathDate = toDateOrNull(pat.deathDate);
+          // If deceased before the ingest date, age is age-at-death; otherwise
+          // age as of the ingest date. Matches the Kuzu side's logic.
+          const ageReference = deathDate && deathDate < ingestDateIso ? deathDate : ingestDateIso;
+          const ageYears = yearsBetween(birthDate, ageReference);
           batch.add('patient',
-            ['patient_id', 'first_name', 'last_name', 'birth_date', 'death_date', 'gender', 'race', 'ethnicity', 'marital_status', 'city', 'state', 'zip'],
-            [pat.id, pat.firstName, pat.lastName, pat.birthDate, pat.deathDate || null, pat.gender, pat.race, pat.ethnicity, pat.maritalStatus, pat.city, pat.state, pat.zip],
+            ['patient_id', 'first_name', 'last_name', 'birth_date', 'death_date', 'age_years', 'gender', 'race', 'ethnicity', 'marital_status', 'city', 'state', 'zip'],
+            [pat.id, pat.firstName, pat.lastName, birthDate, deathDate, ageYears, pat.gender, pat.race, pat.ethnicity, pat.maritalStatus, pat.city, pat.state, pat.zip],
           );
           await batch.flushIfNeeded('patient');
           counts.patients++;
@@ -167,7 +260,7 @@ async function ingest() {
           for (const e of entry.encounters) {
             batch.add('encounter',
               ['encounter_id', 'patient_id', 'provider_id', 'organization_id', 'encounter_class', 'code', 'description', 'start_date', 'stop_date', 'reason_code', 'reason_description'],
-              [e.id, e.patientId, e.providerId || null, e.organizationId || null, e.encounterClass, e.code, e.description, e.startDate, e.stopDate, e.reasonCode, e.reasonDescription],
+              [e.id, e.patientId, e.providerId || null, e.organizationId || null, e.encounterClass, e.code, e.description, toDateOrNull(e.startDate), toDateOrNull(e.stopDate), e.reasonCode, e.reasonDescription],
             );
             await batch.flushIfNeeded('encounter', ['patient']);
             counts.encounters++;
@@ -176,7 +269,7 @@ async function ingest() {
           for (const c of entry.conditions) {
             batch.add('condition',
               ['condition_id', 'patient_id', 'encounter_id', 'code', 'system', 'description', 'start_date', 'stop_date'],
-              [c.id, c.patientId, c.encounterId || null, c.code, c.system, c.description, c.startDate, c.stopDate || null],
+              [c.id, c.patientId, c.encounterId || null, c.code, c.system, c.description, toDateOrNull(c.startDate), toDateOrNull(c.stopDate)],
             );
             await batch.flushIfNeeded('condition', ['patient', 'encounter']);
             counts.conditions++;
@@ -185,16 +278,17 @@ async function ingest() {
           for (const m of entry.medications) {
             batch.add('medication',
               ['medication_id', 'patient_id', 'encounter_id', 'code', 'description', 'start_date', 'stop_date', 'reason_code', 'reason_description'],
-              [m.id, m.patientId, m.encounterId || null, m.code, m.description, m.startDate, m.stopDate || null, m.reasonCode, m.reasonDescription],
+              [m.id, m.patientId, m.encounterId || null, m.code, m.description, toDateOrNull(m.startDate), toDateOrNull(m.stopDate), m.reasonCode, m.reasonDescription],
             );
             await batch.flushIfNeeded('medication', ['patient', 'encounter']);
             counts.medications++;
           }
 
           for (const o of entry.observations) {
+            const norm = normalizeObservation(o.code, o.value, o.units);
             batch.add('observation',
-              ['observation_id', 'patient_id', 'encounter_id', 'category', 'code', 'description', 'value', 'units', 'type', 'date'],
-              [o.id, o.patientId, o.encounterId || null, o.category, o.code, o.description, o.value, o.units, o.type, o.date],
+              ['observation_id', 'patient_id', 'encounter_id', 'category', 'code', 'description', 'value', 'units', 'value_canonical', 'units_canonical', 'type', 'date'],
+              [o.id, o.patientId, o.encounterId || null, o.category, o.code, o.description, o.value, o.units, norm.valueCanonical, norm.unitCanonical, o.type, toDateOrNull(o.date)],
             );
             await batch.flushIfNeeded('observation', ['patient', 'encounter']);
             counts.observations++;
@@ -203,7 +297,7 @@ async function ingest() {
           for (const p of entry.procedures) {
             batch.add('procedure_',
               ['procedure_id', 'patient_id', 'encounter_id', 'code', 'system', 'description', 'start_date', 'stop_date', 'reason_code', 'reason_description'],
-              [p.id, p.patientId, p.encounterId || null, p.code, p.system, p.description, p.startDate, p.stopDate, p.reasonCode, p.reasonDescription],
+              [p.id, p.patientId, p.encounterId || null, p.code, p.system, p.description, toDateOrNull(p.startDate), toDateOrNull(p.stopDate), p.reasonCode, p.reasonDescription],
             );
             await batch.flushIfNeeded('procedure_', ['patient', 'encounter']);
             counts.procedures++;

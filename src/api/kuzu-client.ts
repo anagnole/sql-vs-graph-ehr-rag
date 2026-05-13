@@ -2,9 +2,18 @@ import kuzu from "kuzu";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Subgraph, SubgraphNode, SubgraphEdge, SearchResult } from "./types.js";
+import { recordKuzu, metricsEnabled } from "./metrics.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.resolve(__dirname, "../../.brainifai/data/kuzu");
+const DEFAULT_DB_PATH = path.resolve(__dirname, "../../.brainifai/data/kuzu");
+
+// Resolved lazily so KUZU_DB_PATH env vars set after module import (e.g. in
+// run.ts's main(), or in debug scripts that assign before awaiting) are honored.
+function resolveDbPath(): string {
+  return process.env.KUZU_DB_PATH
+    ? path.resolve(process.env.KUZU_DB_PATH)
+    : DEFAULT_DB_PATH;
+}
 
 let db: kuzu.Database | null = null;
 let conn: kuzu.Connection | null = null;
@@ -16,7 +25,24 @@ export function withLock<T>(fn: () => Promise<T>): Promise<T> {
   const prev = queryLock;
   let resolve: () => void;
   queryLock = new Promise<void>((r) => { resolve = r; });
-  return prev.then(fn).finally(() => resolve!());
+
+  if (!metricsEnabled()) {
+    return prev.then(fn).finally(() => resolve!());
+  }
+
+  // Instrumented path: capture lock wait time vs actual query time separately
+  const enqueuedAt = Date.now();
+  return prev
+    .then(async () => {
+      const startedAt = Date.now();
+      const lockWaitMs = startedAt - enqueuedAt;
+      try {
+        return await fn();
+      } finally {
+        recordKuzu(lockWaitMs, Date.now() - startedAt);
+      }
+    })
+    .finally(() => resolve!());
 }
 
 // Primary key per node type
@@ -33,7 +59,8 @@ const PK: Record<string, string> = {
 
 export async function getConnection(): Promise<kuzu.Connection> {
   if (conn) return conn;
-  db = new kuzu.Database(DB_PATH, 0, true, true);
+  const dbPath = resolveDbPath();
+  db = new kuzu.Database(dbPath, 0, true, true);
   conn = new kuzu.Connection(db);
   await conn.query("LOAD EXTENSION fts");
   return conn;
@@ -47,10 +74,20 @@ export async function closeConnection(): Promise<void> {
   }
 }
 
+// DATE columns come back as JS Date objects. Normalize to YYYY-MM-DD strings so
+// UI/API consumers see stable shapes regardless of schema typing.
+function normalizeDates(row: Record<string, unknown>): Record<string, unknown> {
+  for (const k of Object.keys(row)) {
+    const v = row[k];
+    if (v instanceof Date) row[k] = v.toISOString().slice(0, 10);
+  }
+  return row;
+}
+
 async function q(c: kuzu.Connection, cypher: string): Promise<Record<string, unknown>[]> {
   return withLock(async () => {
     const result = await c.query(cypher);
-    return await result.getAll() as Record<string, unknown>[];
+    return ((await result.getAll()) as Record<string, unknown>[]).map(normalizeDates);
   });
 }
 
@@ -275,13 +312,13 @@ export async function getNodeCard(
       // Active conditions within date range
       const activeConds = await q(c,
         `MATCH (p:Patient {patient_id: '${safeId}'})-[r:DIAGNOSED_WITH]->(c:ConceptCondition)
-         WHERE (r.stop_date IS NULL OR r.stop_date = '')${dateClauses("start_date")}
+         WHERE r.stop_date IS NULL${dateClauses("start_date")}
          RETURN c.description AS description LIMIT 5`);
 
       // Active medications within date range
       const activeMeds = await q(c,
         `MATCH (p:Patient {patient_id: '${safeId}'})-[r:PRESCRIBED]->(m:ConceptMedication)
-         WHERE (r.stop_date IS NULL OR r.stop_date = '')${dateClauses("start_date")}
+         WHERE r.stop_date IS NULL${dateClauses("start_date")}
          RETURN m.description AS description LIMIT 5`);
 
       const age = patient.birth_date

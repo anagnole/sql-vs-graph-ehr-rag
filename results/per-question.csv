@@ -1,4 +1,4 @@
-question_id,type,domain,system,score,score_method,latency_ms,error
-SL-10,simple-lookup,cardiovascular,graph,0.667,fuzzy,24140,
-SL-29,simple-lookup,conditions,graph,1.000,f1,16186,
-SL-53,simple-lookup,demographics,graph,0.000,fuzzy,107889,
+question_id,type,domain,system,score,score_method,latency_ms,kuzu_ms,kuzu_calls,lock_wait_ms,tool_ms,tool_calls,llm_reported_ms,num_turns,cost_usd,error
+TMP-17,temporal,cardiovascular,graph,0.000,error,0,,,,,,,,,"Timeout after 90000ms"
+TMP-65,temporal,conditions,graph,0.000,error,0,,,,,,,,,"Timeout after 90000ms"
+TMP-1,temporal,diabetes,graph,0.364,fuzzy,19904,4,1,0,5,1,,,,
