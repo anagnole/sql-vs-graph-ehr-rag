@@ -1,252 +1,217 @@
 # EHR-Clinical-Assistant
 
-Thesis experiment testing whether **graph-based retrieval improves LLM clinical question answering** compared to SQL and LLM-only baselines — across both proprietary and open-source models.
+Companion code and data for the paper **"Knowledge Graphs vs. SQL Over Structured EHR Data"** (Anagnou et al., *Future Internet*, 2026).
 
-EHR-Clinical-Assistant is a [Brainifai](https://github.com/anagnole/brainifai) child instance — a specialized node with a custom EHR template, its own graph schema, custom context-building MCP tools, and an evaluation harness. It includes a doctor-facing clinical assistant UI with a knowledge graph visualizer.
+A controlled benchmark comparing **five retrieval approaches** for clinical question answering over Synthea EHRs, evaluated across **three models** and **three nested cohort sizes**.
 
 [![Demo](docs/demo-screenshot.png)](https://youtu.be/X7BhfGabk70)
-> **[Watch the demo video](https://youtu.be/X7BhfGabk70)** — Clinical chat with graph-based retrieval, document generation, and multi-model support.
+> **[Watch the clinical-assistant demo](https://youtu.be/X7BhfGabk70)** — Streaming chat with graph retrieval, document generation, and multi-model support.
+
+## Experimental design
+
+- **334 questions** across six categories (simple-lookup, multi-hop, temporal, cohort, reasoning, unanswerable)
+- **5 retrieval approaches**:
+  - `graph` — curated MCP tools over a Kuzu property graph
+  - `graph-cypher` — LLM writes Cypher directly against the same graph
+  - `sql-t2s` — LLM writes SQL against PostgreSQL
+  - `sql-fts` — PostgreSQL full-text search via `to_tsquery`
+  - `llm-only` — patient JSON snapshot in context, no retrieval
+- **3 nested patient cohorts**: 200, 2 000, 20 000 patients (smaller cohorts strictly contained in larger ones)
+- **3 language models**: Claude Haiku 4.5 (Anthropic), Qwen 2.5 72B Instruct (OpenRouter), Llama 3.1 8B Instruct (OpenRouter)
+- **13 640 judged cells** scored by an LLM judge (Claude Haiku 4.5) on a 0 / 0.5 / 1 rubric, with a deterministic token-overlap cross-check
+
+## Headline result (pooled across cohorts)
+
+| Model | Best approach | Score |
+|---|---|---|
+| Claude Haiku 4.5 | `sql-t2s` (graph-cypher at 20K) | 0.83 – 0.88 |
+| Qwen 2.5 72B | `sql-t2s` | 0.73 – 0.77 |
+| Llama 3.1 8B | `sql-fts` | 0.59 – 0.68 |
+
+**Model–capability interaction**: tool-using approaches add ~0.20 to Claude's mean judge score over the context-only baseline, but *reduce* Llama's accuracy by ~0.45 due to tool-call protocol failures.
+
+**Scaling null result**: no approach degrades meaningfully as the cohort grows from 200 to 20 000 patients — the ranking established at the 200-patient prototype tier generalises to 20 000.
+
+Full statistical analysis (Friedman / Wilcoxon / Cliff's δ / bootstrap CIs) and per-question-type breakdowns are in [`docs/analysis/v2/`](docs/analysis/v2/).
 
 ## Architecture
 
 ```
-Synthea (2000+ patients, seed 42)
+Synthea (20,000 patients, seed 42)
         │
         ▼
 ┌───────────────┐     ┌────────────────┐
-│  CSV Parser    │────▶│  JSON Snapshot  │
-│  src/generate  │     │  data/generated │
+│  CSV Parser    │────▶│  JSON snapshots │  per-patient ground-truth
 └───────────────┘     └────────┬───────┘
                                │
               ┌────────────────┼────────────────┐
               ▼                ▼                 ▼
-     ┌──────────────┐  ┌─────────────┐  ┌──────────────┐
-     │  Kuzu Graph   │  │ PostgreSQL  │  │  LLM-Only    │
-     │  .brainifai/  │  │  Docker     │  │  (no retrieval)│
-     │  data/kuzu    │  │  port 5432  │  │              │
-     └──────┬───────┘  └──────┬──────┘  └──────┬───────┘
-            │                 │                 │
-            ▼                 ▼                 ▼
-     ┌──────────────────────────────────────────────┐
-     │     Evaluation Harness (80 questions)         │
-     │  4 systems × 5 question types × N models      │
-     │  Claude (MCP) | Ollama (native tool calling)  │
-     └──────────────────────────────────────────────┘
-            │
-            ▼
-     ┌──────────────────────────────────────────────┐
-     │         Doctor-Facing Clinical UI              │
-     │  Streaming chat + Sigma.js knowledge graph     │
-     │  Model selector (Claude / Ollama)              │
-     └──────────────────────────────────────────────┘
+     ┌──────────────┐  ┌─────────────────┐  ┌──────────────┐
+     │  Kuzu graph   │  │ PostgreSQL +FTS │  │  JSON in ctx  │
+     │  (3 tiers)    │  │  (3 tiers)      │  │  (3 tiers)    │
+     └──────┬───────┘  └────────┬────────┘  └──────┬───────┘
+            │                   │                   │
+            ▼                   ▼                   ▼
+     ┌──────────────────────────────────────────────────────┐
+     │  Evaluation harness (334 q × 5 approaches × 3 models  │
+     │                       × 3 cohorts = 15 030 cells)     │
+     │  Claude (MCP) | Qwen / Llama (OpenAI-compat tools)   │
+     └─────────────────────────┬────────────────────────────┘
+                               ▼
+     ┌──────────────────────────────────────────────────────┐
+     │  LLM-as-judge (Claude Haiku 4.5)                       │
+     │  Three-level rubric (0 / 0.5 / 1) + over_answered     │
+     │  + gt_suspect flags                                    │
+     └──────────────────────────────────────────────────────┘
 ```
 
-## Multi-Model Support
+## Graph schema
 
-The system supports both proprietary and open-source models through a unified provider abstraction ([`@anagnole/claude-cli-wrapper`](https://github.com/anagnole/claude-cli)):
+**7 node tables**: Patient, Encounter, ConceptCondition, ConceptMedication, ConceptObservation, ConceptProcedure, Provider, Organization.
 
-| Provider | Models | Tool Calling | How |
-|----------|--------|-------------|-----|
-| **Claude** (via CLI) | claude-sonnet-4-6, claude-opus-4-6 | MCP tools | Claude CLI subprocess |
-| **Ollama** (local) | qwen2.5:32b, mistral-small, etc. | Native function calling | Ollama HTTP API + agent loop |
+A shared-concept design: each distinct condition / medication / observation / procedure exists once as a concept node carrying its SNOMED / RxNorm / LOINC code; per-patient instances link via dedicated relationships. At the 20 000-patient tier the graph has 305 condition concepts, 356 medication concepts, 297 observation concepts and 412 procedure concepts against 11.9M observation instances — roughly a 100× node reduction vs. naïve per-patient duplication.
 
-Both providers have access to the same 6 EHR tools querying the same Kuzu graph database. Claude uses MCP; Ollama models use native tool calling with direct Kuzu queries.
-
-## Graph Schema
-
-**7 node tables:** Patient, Encounter, ConceptCondition, ConceptMedication, ConceptObservation, ConceptProcedure, Provider
-
-**12 relationships:** DIAGNOSED_WITH, PRESCRIBED, HAS_RESULT, UNDERWENT, HAD_ENCOUNTER, TREATED_BY, AT_ORGANIZATION, TREATS, COMPLICATION_OF, and more
+**12 relationships**: HAS_CONDITION, PRESCRIBED, MEASURED, UNDERWENT, HAD_ENCOUNTER, TREATED_BY, AT_ORGANIZATION, TREATS, COMPLICATION_OF, INDICATED_BY, REASON_FOR, …
 
 FTS indexes on patient names, condition descriptions, medication names, and observation descriptions.
 
-## Question Types
+## Question bank
 
-| Type | Description | Count |
-|------|-------------|-------|
-| **simple-lookup** | Direct fact retrieval (e.g., "What medications is patient X on?") | 16 |
-| **multi-hop** | Requires traversing multiple relationships | 16 |
-| **temporal** | Time-based reasoning (e.g., "Was drug X started before condition Y?") | 16 |
-| **cohort** | Population-level queries (e.g., "How many diabetic patients are on metformin?") | 16 |
-| **reasoning** | Clinical inference from retrieved data | 16 |
+| Type | Count | Description |
+|------|-------|-------------|
+| simple-lookup | 72 | Single fact about a single patient |
+| multi-hop | 58 | Chain two or more clinical relationships |
+| temporal | 56 | Event ordering or interval reasoning |
+| cohort | 60 | Identify or count patients matching combined criteria |
+| reasoning | 60 | Integrate clinical context beyond a single field |
+| unanswerable | 28 | Information absent from the cohort; correct response is refusal |
 
-80 questions curated from 244 candidates, stratified across clinical domains with deterministic selection.
+Questions are generated programmatically from per-category templates against the JSON ground truth, then filtered manually for ambiguity, degenerate ground truth, or trivial answer spaces. Each question carries its supporting record identifiers, so scoring is reproducible.
+
+## Reproducing the paper
+
+See **[REPRODUCING_PAPER.md](REPRODUCING_PAPER.md)** for the end-to-end walkthrough from `git clone` to Figure 2.
 
 ## Prerequisites
 
-- **Node.js** >= 18
-- **Docker** (for PostgreSQL baseline)
-- **Synthea** CSV output in `data/synthea/` (seed 42, 2000+ alive patients)
-- **Claude CLI** installed (for Claude model evaluation and MCP tools)
-- **Ollama** installed (for open-source model evaluation) — `brew install ollama`
+- Node.js ≥ 18
+- Docker (for PostgreSQL)
+- Synthea (`brew install synthea`) — used at seed 42 to produce 20 000 patients
+- Claude CLI (for the Claude runs and MCP transport)
+- An OpenRouter API key in `OPENROUTER_API_KEY` (for Qwen + Llama runs)
+- Python ≥ 3.10 with `numpy pandas scipy seaborn matplotlib` (for the analysis scripts)
 
 ## Setup
 
 ```bash
-# Install dependencies
 npm install
-
-# Start PostgreSQL (baseline)
-npm run pg:up
-
-# Pull an Ollama model (optional, for open-source benchmarks)
-ollama pull qwen2.5:32b
+npm run pg:up                      # PostgreSQL on :5432
 ```
 
 ## Pipeline
 
-The pipeline runs in order: generate → ingest → verify → evaluate.
-
-### 1. Generate synthetic data & questions
-
-Parses Synthea CSVs, profiles the dataset, generates 244 candidate questions, curates 80 for evaluation, and writes JSON snapshots to `data/generated/`.
-
 ```bash
-npm run generate
+npm run generate                   # parse Synthea CSVs → JSON + 334-question bank
+npm run ingest                     # load all three tiers into Kuzu
+npm run pg:ingest                  # load all three tiers into PostgreSQL (+ FTS)
+npm run verify                     # sanity-check graph counts and joins
+
+# Evaluate — one approach × model × tier per invocation
+npm run eval -- --model claude-haiku-4-5 --system graph        --tier 200
+npm run eval -- --model claude-haiku-4-5 --system sql-t2s      --tier 2000
+npm run eval -- --model qwen-2.5-72b     --system graph-cypher --tier 20000
+# …repeat for all 5 × 3 × 3 = 45 combinations
+
+# Score every cell and produce the analysis figures + tables
+python3 scripts/analysis_v2.py
 ```
 
-**Outputs:** `patients.json`, `providers.json`, `ground-truth.json`, `evaluation-questions.json`, `stats.json`
+Outputs land in `docs/analysis/v2/{plots,tables}/` and mirror the paper's Figures 2–8 and Tables 2–4.
 
-### 2. Ingest into databases
+## MCP server
 
-```bash
-# Ingest into Kuzu graph
-npm run ingest
+The graph-retrieval approach exposes 18 clinical tools to the LLM via the Model Context Protocol. The most-used ones:
 
-# Ingest into PostgreSQL
-npm run pg:ingest
-```
-
-### 3. Verify data integrity
-
-```bash
-# Verify Kuzu graph (node counts, relationships, FTS, sample patients)
-npm run verify
-
-# Verify PostgreSQL tables
-npm run pg:verify
-
-# Verify prompt builder output
-npm run prompt:verify
-```
-
-### 4. Run evaluation
-
-Runs all 80 questions against 4 systems, scores answers, and generates reports. Supports any model available through the provider registry.
-
-```bash
-# Run with Claude (default)
-npm run eval
-
-# Run with an Ollama model
-npm run eval -- --model qwen2.5:32b
-
-# Run specific system + model
-npm run eval -- --model qwen2.5:32b --system graph --limit 5
-
-# Quick sample across all question types
-npm run eval -- --model qwen2.5:32b --sample 10
-```
-
-Each model gets its own results file (`results/incremental-<model>.json`), so runs don't overwrite each other. Use `--resume` to continue interrupted runs.
-
-**Outputs in `results/`:**
-- `summary.md` — Overall and per-type/domain score tables
-- `summary.json` — Structured results with per-question detail
-- `per-question.csv` — Flat export for analysis
-
-## Clinical Assistant UI
-
-A doctor-facing web interface with streaming chat and an interactive knowledge graph.
-
-```bash
-# Development (hot reload)
-npm run ui:dev
-
-# Production build
-npm run ui
-```
-
-Features:
-- **Model selector** — switch between Claude and Ollama models
-- **Streaming chat** — real-time responses with tool call visibility
-- **Knowledge graph** — Sigma.js force-directed graph visualization
-- **Node interaction** — click nodes to explore, add as context to queries
-- **Context chips** — attach graph nodes to messages for focused queries
-- **Date filtering** — filter clinical data by time range
-- **Document generation** — generate referral letters, SOAP notes, reports
-- **Clinical templates** — pre-built document templates
-
-## MCP Server
-
-ThesisBrainifai exposes 7 clinical retrieval tools via MCP:
-
-| Tool | Description |
-|------|-------------|
+| Tool | Purpose |
+|------|---------|
 | `search_patients` | Find patients by name or demographics |
-| `get_patient_summary` | Full patient overview (conditions, meds, labs) |
-| `get_diagnoses` | Active and historical diagnoses |
-| `get_medications` | Current and past medications |
-| `get_labs` | Lab results and observations |
-| `get_temporal_relation` | Temporal relationships between clinical events |
-| `find_cohort` | Find patient groups matching clinical criteria |
+| `get_patient_summary` | Full patient overview |
+| `get_diagnoses` / `get_medications` / `get_labs` / `get_procedures` | Domain-scoped retrieval |
+| `get_temporal_relation` | Time-ordering between clinical events |
+| `find_cohort` / `count_cohort` | Population-level criteria matching |
+| `rank_conditions_in_cohort` | Most common diagnoses in a group |
+| `aggregate_observation_for_cohort` | Statistics for a lab/vital across a group |
+| `list_treatments_for_condition` | Common medications for a diagnosis |
 
 ```bash
-# Start the MCP server
 ./start-mcp.sh
 ```
 
-## Preliminary Results
+## Clinical-assistant UI
 
-| System | Score | Avg Latency | Errors |
-|--------|-------|-------------|--------|
-| **graph** | **80.7%** | 12,213ms | 0 |
-| sql | 76.0% | 4,766ms | 0 |
-| sql-fts | 76.0% | 4,843ms | 0 |
-| llm-only | 76.0% | 4,950ms | 0 |
+A doctor-facing chat interface with an interactive Sigma.js knowledge-graph view, used for the qualitative parts of the work (not the paper's quantitative benchmark).
 
-> Only simple-lookup questions with Claude evaluated so far. Multi-hop, temporal, cohort, reasoning types and open-source model comparisons pending.
+```bash
+npm run ui:dev                     # hot-reload dev server
+npm run ui                         # production build
+```
 
-## Project Structure
+Features: model selector (Claude / Qwen / Llama via OpenRouter), streaming chat with tool-call visibility, force-directed knowledge graph, node-click context attachment, date filtering, document generation (referral letters, SOAP notes), clinical templates.
+
+## Repository layout
 
 ```
 ├── data/
 │   ├── synthea/          # Raw Synthea CSV output (gitignored)
-│   ├── generated/        # JSON snapshots (gitignored)
+│   ├── generated/        # JSON snapshots, question bank (gitignored)
 │   ├── documents/        # Generated clinical documents
 │   └── templates/        # Document templates
 ├── docs/
-│   ├── plan.md           # Implementation plan
-│   ├── phases/           # Phase specs (1-6)
-│   └── tickets/          # 41 implementation tickets
-├── results/              # Evaluation output (per-model)
+│   └── analysis/v2/      # Paper's figures, tables, statistical outputs
+├── results/              # Raw eval output per (approach, model, tier) — gitignored
+├── scripts/
+│   ├── analysis_v2.py    # Statistical analysis + paper figures
+│   └── curate-tiers.ts   # Cohort sub-sampling logic
 ├── src/
-│   ├── generate.ts       # Entry: parse CSVs → generate questions
-│   ├── ingest.ts         # Entry: load JSON → Kuzu graph
-│   ├── verify.ts         # Entry: round-trip data verification
-│   ├── snapshot.ts       # Write generated data to JSON
-│   ├── curate.ts         # Select 80 questions from candidates
-│   ├── parser/           # Synthea CSV reader
-│   ├── questions/        # Question generators (5 types)
-│   ├── prompt/           # LLM-only prompt builder
-│   ├── sql/              # PostgreSQL schema, ingestion, adapters
-│   ├── eval/             # Evaluation runner, scorer, report
-│   ├── api/              # Fastify API server, Kuzu client, tools
-│   └── ui/               # React + Sigma.js clinical assistant UI
+│   ├── generate.ts       # CSV → JSON snapshots + question bank
+│   ├── ingest.ts         # JSON → Kuzu graph (per-tier)
+│   ├── sql/              # PostgreSQL schema, ingestion, FTS variant
+│   ├── questions/        # Generators for the 6 question categories
+│   ├── eval/             # Evaluation runner, LLM-as-judge scorer
+│   ├── prompt/           # System prompts per retrieval approach
+│   ├── api/              # Fastify API + Kuzu client + MCP tools
+│   └── ui/               # React + Sigma.js clinical UI
 ├── docker-compose.yml    # PostgreSQL 16
 ├── start-mcp.sh          # MCP server launcher
 └── package.json
 ```
 
-## Tech Stack
+## Tech stack
 
-- **TypeScript** with tsx for execution
-- **Kuzu** — Embedded graph database for EHR data
-- **PostgreSQL 16** — Relational baseline (standard + FTS)
-- **[@anagnole/claude-cli-wrapper](https://github.com/anagnole/claude-cli)** — Unified provider abstraction (Claude CLI + Ollama)
-- **Ollama** — Local open-source model inference
-- **MCP** — Model Context Protocol for tool-based retrieval
-- **Fastify** — API server with WebSocket support
-- **React + Sigma.js** — Clinical assistant UI with graph visualization
-- **Vite** — Frontend build and dev server
-- **Synthea** — Synthetic patient data generation
+- **TypeScript** + tsx — pipeline, evaluation harness
+- **Kuzu** — embedded graph DB (Cypher)
+- **PostgreSQL 16** — relational baseline + FTS variant
+- **Claude CLI** + **OpenRouter** — three-model harness, unified via `@anagnole/claude-cli-wrapper`
+- **MCP** — Model Context Protocol for the curated-graph approach
+- **Synthea** — synthetic patient generation (seed 42)
+- **Python 3 / pandas / scipy / seaborn** — statistical analysis and plotting
+- **Fastify + React + Sigma.js** — clinical UI
+
+## Citation
+
+If you use this code, the question bank, or the per-tier databases, please cite:
+
+```bibtex
+@article{anagnou2026graphsql,
+  title  = {Knowledge Graphs vs. SQL Over Structured EHR Data},
+  author = {Anagnou, Leonidas and Vezakis, Andreas and Vezakis, Ioannis
+           and Kakkos, Ioannis and Matsopoulos, George K.},
+  journal= {Future Internet},
+  year   = {2026},
+  note   = {In press}
+}
+```
+
+## License
+
+Released under CC BY 4.0 (paper) and MIT (code), consistent with MDPI's open-access policy.

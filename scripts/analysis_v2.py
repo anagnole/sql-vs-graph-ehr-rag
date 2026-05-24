@@ -137,7 +137,7 @@ def draw_pipeline_diagram(path):
     # Scored cell
     box(8.0, 2.5, 1.8, 1.0, "Scored cell\n(judgeScore +\nrationale)", color="#fff2cc")
     # Labels
-    ax.text(3.6, 5.95, "5 retrieval paradigms (run in parallel per question)",
+    ax.text(3.6, 5.95, "5 retrieval approaches (run in parallel per question)",
             ha="center", fontsize=10, style="italic")
     ax.text(5.0, 0.4,
             f"Repeated for: 3 models (Claude/Qwen/Llama) × 3 tiers (200/2K/20K) × {len(df):,} judged cells",
@@ -186,12 +186,12 @@ for (model, tier, system), g in df.groupby(["model", "tier", "system"]):
 desc_df = pd.DataFrame(desc).sort_values(["model", "tier", "system"])
 desc_df.to_csv(TABLES / "1_descriptive_means.csv", index=False)
 
-# Plot: faceted bar by model, x=tier, hue=system
+# Plot: faceted bar by model, x=tier, hue=approach
 g = sns.catplot(
-    data=desc_df,
-    x="tier", y="mean", hue="system", col="model",
+    data=desc_df.rename(columns={"system": "approach"}),
+    x="tier", y="mean", hue="approach", col="model",
     kind="bar", height=4, aspect=1.0, palette=SYSTEM_PALETTE,
-    hue_order=SYSTEMS, col_wrap=2,
+    hue_order=SYSTEMS,
 )
 for ax, (model_name, sub) in zip(g.axes.flat, desc_df.groupby("model")):
     for i, system in enumerate(SYSTEMS):
@@ -215,9 +215,10 @@ for ax, (model_name, sub) in zip(g.axes.flat, desc_df.groupby("model")):
             )
     ax.set_ylim(0, 1.0)
     ax.set_ylabel("Judge score")
+    ax.set_xlabel("subset")
 g.set_titles("{col_name}")
-g.fig.suptitle("Judge accuracy per system × tier (95% bootstrap CI)", y=1.02)
-plt.savefig(PLOTS / "1_system_means.png")
+g.fig.suptitle("Judge accuracy per approach × subset (95% bootstrap CI)", y=1.02)
+plt.savefig(PLOTS / "1_system_means.png", dpi=150, bbox_inches="tight")
 plt.close()
 
 
