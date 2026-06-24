@@ -14,7 +14,7 @@ export interface EvalQuestion {
 
 export interface RunResult {
   questionId: string;
-  system: 'graph' | 'sql' | 'sql-fts' | 'sql-t2s' | 'llm-only' | 'graph-cypher';
+  system: 'graph' | 'sql' | 'sql-fts' | 'sql-t2s' | 'llm-only' | 'graph-cypher' | 'rag-dense';
   model: string;
   answer: string;
   latencyMs: number;
@@ -38,6 +38,10 @@ export interface RunResult {
     numTurns?: number;
     /** Total USD cost for this question, parsed from Claude CLI's total_cost_usd field. Undefined for local/Ollama models. */
     costUsd?: number;
+    /** Output tokens reported by the vendor CLI (Copilot route). Input tokens are not reported, so this is a partial measure. */
+    outputTokens?: number;
+    /** Prompt tokens summed across rounds (OpenRouter route). */
+    inputTokens?: number;
   };
 }
 

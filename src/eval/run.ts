@@ -18,13 +18,14 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import pg from 'pg';
 import type { EvalQuestion, RunResult, ScoredResult } from './types.js';
-import { runGraph, runSql, runSqlFts, runSqlT2S, runLlmOnly, runGraphCypher } from './runner.js';
+import { runGraph, runSql, runSqlFts,
+  runRagDense, runSqlT2S, runLlmOnly, runGraphCypher } from './runner.js';
 import { score } from './scorer.js';
 import { generateReport } from './report.js';
 
 const PROJECT_ROOT = join(import.meta.dirname, '../..');
 const RESULTS_DIR = join(PROJECT_ROOT, 'results');
-type System = 'graph' | 'sql' | 'sql-fts' | 'sql-t2s' | 'llm-only' | 'graph-cypher';
+type System = 'graph' | 'sql' | 'sql-fts' | 'sql-t2s' | 'llm-only' | 'graph-cypher' | 'rag-dense';
 
 function getArg(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -98,7 +99,7 @@ async function main() {
   // Tier mode: point MCP at the tier-specific Kuzu DB and use the tiered
   // question bank with cohort ground-truth-per-tier.
   if (tier) {
-    const validTiers = ['200', '2000', '20000'];
+    const validTiers = ['200', '2000', '20000', '1M'];
     if (!validTiers.includes(tier)) {
       console.error(`Invalid --tier '${tier}'. Must be one of: ${validTiers.join(', ')}`);
       process.exit(1);
@@ -209,7 +210,7 @@ async function main() {
   // Setup
   const PG_DSN = process.env.PG_DSN ?? 'postgresql://user@localhost:5432/ehrdb';
   let pool: pg.Pool | null = null;
-  if (systems.includes('sql') || systems.includes('sql-fts') || systems.includes('sql-t2s')) {
+  if (systems.includes('sql') || systems.includes('sql-fts') || systems.includes('sql-t2s') || systems.includes('rag-dense')) {
     pool = new pg.Pool({ connectionString: PG_DSN });
   }
 
@@ -260,6 +261,7 @@ async function main() {
               case 'graph': return runGraph(q, model, runOpts);
               case 'sql': return runSql(q, pool!, model, runOpts);
               case 'sql-fts': return runSqlFts(q, pool!, model, runOpts);
+              case 'rag-dense': return runRagDense(q, pool!, model, runOpts);
               case 'sql-t2s': return runSqlT2S(q, pool!, model, runOpts);
               case 'graph-cypher': return runGraphCypher(q, model, runOpts);
               case 'llm-only': return runLlmOnly(q, model, runOpts);

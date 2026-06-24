@@ -7,7 +7,7 @@
 
 import pg from 'pg';
 import { createReadStream, readFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { createRequire } from 'node:module';
@@ -52,14 +52,31 @@ const GEN_DIR = join(PROJECT_ROOT, 'data', 'generated');
 
 // CLI: --tier <name> selects a tier-specific patient subset and database.
 const argv = process.argv.slice(2);
-const tierFlag = (() => {
-  const i = argv.indexOf('--tier');
+function argValue(flag: string): string | null {
+  const i = argv.indexOf(flag);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
-})();
+}
+const tierFlag = argValue('--tier');
+const sourceFlag = argValue('--source');
+const allowlistFlag = argValue('--allowlist');
+const asOfFlag = argValue('--as-of');
+const providersFlag = argValue('--providers');
+const appendMode = argv.includes('--append');
+
+if (appendMode && !providersFlag) {
+  console.error('--append requires --providers <shard providers json> — shards reference providers outside the already-loaded set (FK violations otherwise).');
+  process.exit(1);
+}
+
+const SOURCE_PATH = sourceFlag ? resolve(sourceFlag) : join(GEN_DIR, 'patients.json');
 
 // Load patient allowlist if tier specified — patients not in this set are skipped.
 const tierAllowlist: Set<string> | null = (() => {
-  if (!tierFlag) return null;
+  if (allowlistFlag === 'none') return null;
+  if (allowlistFlag) {
+    return new Set(JSON.parse(readFileSync(resolve(allowlistFlag), 'utf-8')) as string[]);
+  }
+  if (!tierFlag || appendMode) return null;
   const tierFile = join(GEN_DIR, `tier-${tierFlag}.json`);
   if (!existsSync(tierFile)) {
     console.error(`Tier file not found: ${tierFile}`);
@@ -76,9 +93,10 @@ const PG_DSN = process.env.PG_DSN ?? (
 );
 
 if (tierFlag) {
-  console.log(`Tier mode: --tier ${tierFlag}`);
+  console.log(`Tier mode: --tier ${tierFlag}${appendMode ? ' (append)' : ''}`);
   console.log(`  Database: ${PG_DSN}`);
-  console.log(`  Allowlist: ${tierAllowlist!.size} patients`);
+  if (tierAllowlist) console.log(`  Allowlist: ${tierAllowlist.size} patients`);
+  if (sourceFlag) console.log(`  Source: ${SOURCE_PATH}`);
 }
 
 // ─── Batch inserter ──────────────────────────────────────────────────────────
@@ -148,20 +166,25 @@ async function ingest() {
   const pool = new pg.Pool({ connectionString: PG_DSN });
 
   try {
-    // Drop existing tables and recreate
-    console.log('Creating schema (with FTS)...');
-    await pool.query(`
-      DROP TABLE IF EXISTS observation_reference_range CASCADE;
-      DROP TABLE IF EXISTS procedure_ CASCADE;
-      DROP TABLE IF EXISTS observation CASCADE;
-      DROP TABLE IF EXISTS medication CASCADE;
-      DROP TABLE IF EXISTS condition CASCADE;
-      DROP TABLE IF EXISTS encounter CASCADE;
-      DROP TABLE IF EXISTS patient CASCADE;
-      DROP TABLE IF EXISTS provider CASCADE;
-      DROP TABLE IF EXISTS organization CASCADE;
-    `);
-    await createSchema(pool, true);
+    if (appendMode) {
+      const probe = await pool.query(`SELECT COUNT(*) AS cnt FROM patient`);
+      console.log(`Append mode: existing schema retained (${probe.rows[0].cnt} patients already loaded).`);
+    } else {
+      // Drop existing tables and recreate
+      console.log('Creating schema (with FTS)...');
+      await pool.query(`
+        DROP TABLE IF EXISTS observation_reference_range CASCADE;
+        DROP TABLE IF EXISTS procedure_ CASCADE;
+        DROP TABLE IF EXISTS observation CASCADE;
+        DROP TABLE IF EXISTS medication CASCADE;
+        DROP TABLE IF EXISTS condition CASCADE;
+        DROP TABLE IF EXISTS encounter CASCADE;
+        DROP TABLE IF EXISTS patient CASCADE;
+        DROP TABLE IF EXISTS provider CASCADE;
+        DROP TABLE IF EXISTS organization CASCADE;
+      `);
+      await createSchema(pool, true);
+    }
 
     // Reference-range table: one row per curated LOINC code. Loaded first so
     // observation rows don't depend on it (it's a lookup, not an FK).
@@ -191,19 +214,23 @@ async function ingest() {
     // age_years computed as of the ingest date (or at death if the patient died
     // before then). Stored once; re-ingest is the refresh mechanism, same as
     // the Kuzu side.
-    const ingestDateIso = new Date().toISOString().slice(0, 10);
+    const ingestDateIso = asOfFlag ?? new Date().toISOString().slice(0, 10);
+    if (asOfFlag) console.log(`age_years reference date pinned to ${asOfFlag}`);
 
     const batch = new BatchInserter(pool, 500);
 
     // ── 1. Providers & Organizations ─────────────────────────────────────
-    console.log('Loading providers.json...');
-    const providersRaw: Record<string, { provider: Provider; organization: Organization }> =
-      JSON.parse(readFileSync(join(GEN_DIR, 'providers.json'), 'utf-8'));
+    // In append mode the source is the shard's provider universe; inserts are
+    // ON CONFLICT DO NOTHING so overlap with already-loaded providers is free.
+    const providersPath = appendMode ? resolve(providersFlag!) : join(GEN_DIR, 'providers.json');
+    console.log(`Loading ${providersPath}...`);
+    const providersRaw: Record<string, { provider: Provider; organization: Organization | null }> =
+      JSON.parse(readFileSync(providersPath, 'utf-8'));
 
     const orgSet = new Set<string>();
     for (const entry of Object.values(providersRaw)) {
       const o = entry.organization;
-      if (!orgSet.has(o.id)) {
+      if (o && !orgSet.has(o.id)) {
         orgSet.add(o.id);
         batch.add('organization',
           ['organization_id', 'name', 'city', 'state', 'zip', 'phone'],
@@ -224,13 +251,13 @@ async function ingest() {
     await batch.flush('provider');
     console.log(`  Providers: ${Object.keys(providersRaw).length}`);
 
-    // ── 2. Stream patients.json ──────────────────────────────────────────
-    console.log('Streaming patients.json...');
+    // ── 2. Stream source JSON ──────────────────────────────────────────
+    console.log(`Streaming ${SOURCE_PATH}...`);
 
     const counts = { patients: 0, encounters: 0, conditions: 0, medications: 0, observations: 0, procedures: 0 };
 
     await pipeline(
-      createReadStream(join(GEN_DIR, 'patients.json')),
+      createReadStream(SOURCE_PATH),
       parser(),
       streamObject(),
       new Transform({

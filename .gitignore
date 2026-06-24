@@ -41,3 +41,19 @@ results/*.backup-*.json
 
 # Python venv for the analysis scripts
 .venv-analysis/
+# OpenClaw agent scaffolding
+.openclaw/
+SOUL.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+TOOLS.md
+MEMORY.md
+BOOTSTRAP.md
+_quarantine_delete_me
+data/tier-200.db
+docs/figures
+docs/final_submission.pdf
+latex
+reference_theses
+notes

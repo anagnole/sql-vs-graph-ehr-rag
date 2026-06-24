@@ -6,7 +6,7 @@
  *
  * Design:
  * - Runs as a post-scoring pass on existing results (no re-running the eval)
- * - Uses a 0-3 rubric normalized to 0-1
+ * - Rubric returns a graded score of 0, 0.5, or 1 (stored directly)
  * - Stores judgeScore + judgeRationale on each ScoredResult
  * - Can use any model (Claude Haiku for cost, Sonnet for accuracy)
  *
@@ -97,19 +97,20 @@ function parseJudgeText(text: string): { score: number; rationale: string } {
     try {
       const parsed = JSON.parse(jsonMatch[0]) as { score: number; rationale: string };
       return {
-        score: Math.max(0, Math.min(3, parsed.score)),
+        score: Math.max(0, Math.min(1, parsed.score)),
         rationale: parsed.rationale ?? '',
       };
     } catch {
       /* fall through to line-level extraction */
     }
   }
-  // Fallback: extract score/rationale fields individually
-  const scoreMatch = text.match(/"score"\s*:\s*(\d)/);
+  // Fallback: extract score/rationale fields individually. Match decimals so
+  // a 0.5 isn't truncated to 0 by a single-digit capture.
+  const scoreMatch = text.match(/"score"\s*:\s*(\d+(?:\.\d+)?)/);
   const rationaleMatch = text.match(/"rationale"\s*:\s*"([^"]+)"/);
   if (scoreMatch) {
     return {
-      score: Math.max(0, Math.min(3, parseInt(scoreMatch[1]))),
+      score: Math.max(0, Math.min(1, parseFloat(scoreMatch[1]))),
       rationale: rationaleMatch?.[1] ?? 'parse fallback',
     };
   }
@@ -290,7 +291,7 @@ export async function runJudge(
           r.answer,
           judgeModel,
         );
-        r.judgeScore = result.score / 3; // normalize to 0-1
+        r.judgeScore = result.score; // rubric returns 0 / 0.5 / 1 directly
         r.judgeRationale = result.rationale;
         // Accumulate per-call cost when the route reports one (Claude CLI
         // returns total_cost_usd; OpenRouter returns 0 and token counts).
