@@ -262,6 +262,28 @@ export async function searchNodes(
     }
   } catch (e) { console.error("[graph search] medication FTS error:", e); }
 
+  // Search concept observations (labs/vitals)
+  try {
+    const rows = await q(c,
+      `CALL QUERY_FTS_INDEX('ConceptObservation', 'observation_fts', '${safeQ}')
+       RETURN node.code AS id, node.description AS description, score
+       ORDER BY score DESC LIMIT ${limit}`);
+    for (const r of rows) {
+      results.push({ id: r.id as string, type: "ConceptObservation", label: r.description as string, score: r.score as number });
+    }
+  } catch (e) { console.error("[graph search] observation FTS error:", e); }
+
+  // Search concept procedures
+  try {
+    const rows = await q(c,
+      `CALL QUERY_FTS_INDEX('ConceptProcedure', 'procedure_fts', '${safeQ}')
+       RETURN node.code AS id, node.description AS description, score
+       ORDER BY score DESC LIMIT ${limit}`);
+    for (const r of rows) {
+      results.push({ id: r.id as string, type: "ConceptProcedure", label: r.description as string, score: r.score as number });
+    }
+  } catch (e) { console.error("[graph search] procedure FTS error:", e); }
+
   results.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
   return results.slice(0, limit);
 }

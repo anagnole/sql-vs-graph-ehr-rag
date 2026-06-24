@@ -13,7 +13,7 @@
 
 import kuzu from 'kuzu';
 import { createReadStream, readFileSync, writeFileSync, createWriteStream, mkdirSync, rmSync, existsSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Transform } from 'node:stream';
 import { createRequire } from 'node:module';
@@ -35,10 +35,24 @@ const GEN_DIR = join(PROJECT_ROOT, 'data', 'generated');
 // CLI: --tier <name> selects a tier-specific patient subset and DB path.
 // Without --tier, ingests the full dataset into the default kuzu DB.
 const argv = process.argv.slice(2);
-const tierFlag = (() => {
-  const i = argv.indexOf('--tier');
+function argValue(flag: string): string | null {
+  const i = argv.indexOf(flag);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
-})();
+}
+const tierFlag = argValue('--tier');
+const sourceFlag = argValue('--source');
+const allowlistFlag = argValue('--allowlist');
+const asOfFlag = argValue('--as-of');
+const providersFlag = argValue('--providers');
+const appendMode = argv.includes('--append');
+const finalizeMode = argv.includes('--finalize');
+const skipFts = argv.includes('--no-fts');
+
+if (appendMode && !providersFlag) {
+  console.error('--append requires --providers <shard providers json>.');
+  console.error('Shards reference providers outside the already-loaded set; appending without them fails on TREATED_BY/AT_ORGANIZATION COPY.');
+  process.exit(1);
+}
 
 const DB_PATH = tierFlag
   ? join(PROJECT_ROOT, '.brainifai', 'data', `kuzu-${tierFlag}`)
@@ -46,10 +60,17 @@ const DB_PATH = tierFlag
 
 const TMP_DIR = join(PROJECT_ROOT, tierFlag ? `.tmp-csv-${tierFlag}` : '.tmp-csv');
 
+const SOURCE_PATH = sourceFlag ? resolve(sourceFlag) : join(GEN_DIR, 'patients.json');
+const STATE_PATH = join(GEN_DIR, `ingest-state-${tierFlag ?? 'full'}.json`);
+
 // Load patient allowlist if tier specified — patients not in this set are skipped
 // during streaming, producing a Kuzu DB containing only the tier's cohort.
 const tierAllowlist: Set<string> | null = (() => {
-  if (!tierFlag) return null;
+  if (allowlistFlag === 'none') return null;
+  if (allowlistFlag) {
+    return new Set(JSON.parse(readFileSync(resolve(allowlistFlag), 'utf-8')) as string[]);
+  }
+  if (!tierFlag || appendMode || finalizeMode) return null;
   const tierFile = join(GEN_DIR, `tier-${tierFlag}.json`);
   if (!existsSync(tierFile)) {
     console.error(`Tier file not found: ${tierFile}`);
@@ -61,9 +82,11 @@ const tierAllowlist: Set<string> | null = (() => {
 })();
 
 if (tierFlag) {
-  console.log(`Tier mode: --tier ${tierFlag}`);
+  const mode = finalizeMode ? ' (finalize)' : appendMode ? ' (append)' : '';
+  console.log(`Tier mode: --tier ${tierFlag}${mode}`);
   console.log(`  DB path: ${DB_PATH}`);
-  console.log(`  Allowlist: ${tierAllowlist!.size} patients`);
+  if (tierAllowlist) console.log(`  Allowlist: ${tierAllowlist.size} patients`);
+  if (sourceFlag) console.log(`  Source: ${SOURCE_PATH}`);
 }
 
 // ─── CSV helpers ──────────────────────────────────────────────────────────────
@@ -152,11 +175,106 @@ interface ConceptMedication { code: string; description: string }
 interface ConceptObservation { code: string; description: string; category: string; units: string; type: string }
 interface ConceptProcedure { code: string; system: string; description: string }
 
+// ─── Cross-shard ingest state (append/finalize modes) ────────────────────────
+
+interface IngestTotals {
+  patients: number; encounters: number;
+  conditions: number; medications: number; observations: number; procedures: number;
+  providers: number; organizations: number;
+}
+
+interface IngestState {
+  concepts: { conditions: string[]; medications: string[]; observations: string[]; procedures: string[] };
+  written_edges: { treats: string[]; indicated_by: string[]; complication_of: string[]; reason_for: number };
+  pending_edges: { treats: string[]; indicated_by: string[]; reason_for: [string, string][] };
+  totals: IngestTotals;
+  shards: { source: string; timestamp: string; patients: number; encounters: number }[];
+}
+
+function emptyState(): IngestState {
+  return {
+    concepts: { conditions: [], medications: [], observations: [], procedures: [] },
+    written_edges: { treats: [], indicated_by: [], complication_of: [], reason_for: 0 },
+    pending_edges: { treats: [], indicated_by: [], reason_for: [] },
+    totals: { patients: 0, encounters: 0, conditions: 0, medications: 0, observations: 0, procedures: 0, providers: 0, organizations: 0 },
+    shards: [],
+  };
+}
+
+function loadState(): IngestState | null {
+  if (!existsSync(STATE_PATH)) return null;
+  return JSON.parse(readFileSync(STATE_PATH, 'utf-8')) as IngestState;
+}
+
+function saveState(state: IngestState): void {
+  writeFileSync(STATE_PATH, JSON.stringify(state), 'utf-8');
+}
+
+const FTS_INDEXES: [string, string][] = [
+  ['Patient', 'patient_fts'],
+  ['ConceptCondition', 'condition_fts'],
+  ['ConceptMedication', 'medication_fts'],
+  ['ConceptObservation', 'observation_fts'],
+  ['ConceptProcedure', 'procedure_fts'],
+  ['Provider', 'provider_fts'],
+  ['Organization', 'organization_fts'],
+];
+
+const FTS_FIELDS: Record<string, string[]> = {
+  Patient: ['first_name', 'last_name', 'city'],
+  ConceptCondition: ['description', 'code'],
+  ConceptMedication: ['description', 'code'],
+  ConceptObservation: ['description', 'code'],
+  ConceptProcedure: ['description', 'code'],
+  Provider: ['name', 'specialty'],
+  Organization: ['name', 'city'],
+};
+
+async function dropFtsIndexes(conn: InstanceType<typeof kuzu.Connection>): Promise<void> {
+  for (const [table, index] of FTS_INDEXES) {
+    try {
+      await conn.query(`CALL DROP_FTS_INDEX('${table}', '${index}')`);
+    } catch { /* may not exist */ }
+  }
+}
+
+async function createFtsIndexes(conn: InstanceType<typeof kuzu.Connection>): Promise<void> {
+  for (const [table, index] of FTS_INDEXES) {
+    const fields = FTS_FIELDS[table].map((f) => `'${f}'`).join(', ');
+    try {
+      await conn.query(`CALL CREATE_FTS_INDEX('${table}', '${index}', [${fields}])`);
+    } catch { /* may already exist */ }
+  }
+}
+
 // ─── Main ingestion ─────────────────────────────────────────────────────────
 
 async function ingest() {
-  console.log('Starting EHR data ingestion (concept node model)...');
+  console.log(`Starting EHR data ingestion (concept node model)${appendMode ? ' — APPEND' : ''}...`);
   const startTime = Date.now();
+
+  let state: IngestState;
+  if (appendMode) {
+    if (!existsSync(DB_PATH)) {
+      console.error(`--append requires an existing DB at ${DB_PATH}`);
+      process.exit(1);
+    }
+    const loaded = loadState();
+    if (!loaded) {
+      console.error(`--append requires the ingest state file at ${STATE_PATH}`);
+      console.error('Run a fresh (non-append) ingest for this tier first.');
+      process.exit(1);
+    }
+    state = loaded;
+    console.log(`  State: ${state.totals.patients} patients ingested across ${state.shards.length} prior run(s)`);
+  } else {
+    state = emptyState();
+  }
+
+  const knownConditions = new Set(state.concepts.conditions);
+  const knownMedications = new Set(state.concepts.medications);
+  const knownObservations = new Set(state.concepts.observations);
+  const knownProcedures = new Set(state.concepts.procedures);
 
   // Ensure parent dir exists. Kuzu refuses to use a pre-created directory —
   // it wants to initialize the DB itself, so we only mkdir the parent.
@@ -168,32 +286,71 @@ async function ingest() {
 
   try {
     // ── 1. Providers & Organizations ─────────────────────────────────────
+    // Skipped in append mode: the provider universe is deterministic across
+    // Synthea shards (name-based v3 UUIDs + pinned clinicianSeed), so the
+    // initial ingest already loaded every provider/organization.
 
-    console.log('Loading providers.json...');
-    const providersRaw: Record<string, { provider: Provider; organization: Organization }> =
-      JSON.parse(readFileSync(join(GEN_DIR, 'providers.json'), 'utf-8'));
-
-    const providers: Provider[] = [];
-    const orgMap = new Map<string, Organization>();
-    for (const entry of Object.values(providersRaw)) {
-      providers.push(entry.provider);
-      if (!orgMap.has(entry.organization.id)) {
-        orgMap.set(entry.organization.id, entry.organization);
-      }
-    }
-    const organizations = [...orgMap.values()];
-
+    let providers: Provider[] = [];
+    let organizations: Organization[] = [];
     const orgFile = join(TMP_DIR, 'organizations.csv');
-    writeCsvFromArray(orgFile, Object.values(ORGANIZATION_FIELDS), organizations, ORGANIZATION_FIELDS);
-    console.log(`  Organizations: ${organizations.length}`);
-
     const provFile = join(TMP_DIR, 'providers.csv');
-    writeCsvFromArray(provFile, Object.values(PROVIDER_FIELDS), providers, PROVIDER_FIELDS);
-    console.log(`  Providers: ${providers.length}`);
+    const affiliatedFile = join(TMP_DIR, 'affiliated_with_new.csv');
 
-    // ── 2. Stream patients.json → concept maps + relationship CSVs ──────
+    if (!appendMode) {
+      console.log('Loading providers.json...');
+      const providersRaw: Record<string, { provider: Provider; organization: Organization }> =
+        JSON.parse(readFileSync(join(GEN_DIR, 'providers.json'), 'utf-8'));
 
-    console.log('Streaming patients.json...');
+      const orgMap = new Map<string, Organization>();
+      for (const entry of Object.values(providersRaw)) {
+        providers.push(entry.provider);
+        if (!orgMap.has(entry.organization.id)) {
+          orgMap.set(entry.organization.id, entry.organization);
+        }
+      }
+      organizations = [...orgMap.values()];
+
+      writeCsvFromArray(orgFile, Object.values(ORGANIZATION_FIELDS), organizations, ORGANIZATION_FIELDS);
+      console.log(`  Organizations: ${organizations.length}`);
+
+      writeCsvFromArray(provFile, Object.values(PROVIDER_FIELDS), providers, PROVIDER_FIELDS);
+      console.log(`  Providers: ${providers.length}`);
+    } else {
+      console.log(`Loading shard providers from ${providersFlag}...`);
+      const shardProvidersRaw: Record<string, { provider: Provider; organization: Organization | null }> =
+        JSON.parse(readFileSync(resolve(providersFlag!), 'utf-8'));
+
+      const provResult = await conn.query('MATCH (p:Provider) RETURN p.provider_id AS id') as unknown as { getAll(): Promise<{ id: string }[]> };
+      const existingProviders = new Set<string>((await provResult.getAll()).map((r) => r.id));
+      const orgResult = await conn.query('MATCH (o:Organization) RETURN o.organization_id AS id') as unknown as { getAll(): Promise<{ id: string }[]> };
+      const existingOrgs = new Set<string>((await orgResult.getAll()).map((r) => r.id));
+
+      const newOrgMap = new Map<string, Organization>();
+      for (const entry of Object.values(shardProvidersRaw)) {
+        if (!existingProviders.has(entry.provider.id)) {
+          providers.push(entry.provider);
+        }
+        const org = entry.organization;
+        if (org && !existingOrgs.has(org.id) && !newOrgMap.has(org.id)) {
+          newOrgMap.set(org.id, org);
+        }
+      }
+      organizations = [...newOrgMap.values()];
+
+      writeCsvFromArray(orgFile, Object.values(ORGANIZATION_FIELDS), organizations, ORGANIZATION_FIELDS);
+      writeCsvFromArray(provFile, Object.values(PROVIDER_FIELDS), providers, PROVIDER_FIELDS);
+      const affLines = ['provider_id,organization_id'];
+      for (const p of providers) {
+        if (p.organizationId) affLines.push([p.id, p.organizationId].map(escapeCsv).join(','));
+      }
+      writeFileSync(affiliatedFile, affLines.join('\n'), 'utf-8');
+      console.log(`  New organizations: ${organizations.length} (${existingOrgs.size} already loaded)`);
+      console.log(`  New providers: ${providers.length} (${existingProviders.size} already loaded)`);
+    }
+
+    // ── 2. Stream source JSON → concept maps + relationship CSVs ──────
+
+    console.log(`Streaming ${SOURCE_PATH}...`);
 
     // Concept collectors (keyed by code)
     const conceptConditions = new Map<string, ConceptCondition>();
@@ -212,7 +369,8 @@ async function ingest() {
       'gender', 'race', 'ethnicity', 'marital_status', 'city', 'state', 'zip',
     ];
     writeCsvHeader(patWriter, PATIENT_CSV_COLS);
-    const ingestDateIso = new Date().toISOString().slice(0, 10);
+    const ingestDateIso = asOfFlag ?? new Date().toISOString().slice(0, 10);
+    if (asOfFlag) console.log(`  age_years reference date pinned to ${asOfFlag}`);
 
     function yearsBetween(birthIso: string, asOfIso: string): number | '' {
       if (!birthIso) return '';
@@ -262,7 +420,7 @@ async function ingest() {
     let condCount = 0, medCount = 0, obsCount = 0, procCount = 0, encCount = 0;
 
     await pipeline(
-      createReadStream(join(GEN_DIR, 'patients.json')),
+      createReadStream(SOURCE_PATH),
       parser(),
       streamObject(),
       new Transform({
@@ -319,7 +477,7 @@ async function ingest() {
 
           // Conditions → concept + relationship
           for (const c of entry.conditions) {
-            if (!conceptConditions.has(c.code)) {
+            if (!knownConditions.has(c.code) && !conceptConditions.has(c.code)) {
               conceptConditions.set(c.code, { code: c.code, system: c.system || 'SNOMED-CT', description: c.description });
             }
             writeCsvLine(diagWriter, [pid, c.code, toDateString(c.startDate), toDateString(c.stopDate ?? ''), c.encounterId]);
@@ -328,7 +486,7 @@ async function ingest() {
 
           // Medications → concept + relationship + TREATS mapping
           for (const m of entry.medications) {
-            if (!conceptMedications.has(m.code)) {
+            if (!knownMedications.has(m.code) && !conceptMedications.has(m.code)) {
               conceptMedications.set(m.code, { code: m.code, description: m.description });
             }
             writeCsvLine(prescWriter, [pid, m.code, toDateString(m.startDate), toDateString(m.stopDate ?? ''), m.encounterId, m.reasonCode, m.reasonDescription]);
@@ -343,7 +501,7 @@ async function ingest() {
 
           // Observations → concept + relationship, with unit normalization
           for (const o of entry.observations) {
-            if (!conceptObservations.has(o.code)) {
+            if (!knownObservations.has(o.code) && !conceptObservations.has(o.code)) {
               conceptObservations.set(o.code, {
                 code: o.code, description: o.description,
                 category: o.category, units: o.units, type: o.type,
@@ -361,7 +519,7 @@ async function ingest() {
 
           // Procedures → concept + relationship + INDICATED_BY mapping
           for (const p of entry.procedures) {
-            if (!conceptProcedures.has(p.code)) {
+            if (!knownProcedures.has(p.code) && !conceptProcedures.has(p.code)) {
               conceptProcedures.set(p.code, { code: p.code, system: p.system || 'SNOMED-CT', description: p.description });
             }
             writeCsvLine(underwentWriter, [pid, p.code, toDateString(p.startDate), toDateString(p.stopDate ?? ''), p.encounterId, p.reasonCode, p.reasonDescription]);
@@ -390,15 +548,22 @@ async function ingest() {
     console.log(`  Observations: ${obsCount} (${conceptObservations.size} unique concepts)`);
     console.log(`  Procedures: ${procCount} (${conceptProcedures.size} unique concepts)`);
 
-    // Write deferred REASON_FOR CSV (encounter→condition, only for known condition codes)
+    // Write deferred REASON_FOR CSV (encounter→condition, only for known condition codes).
+    // Unresolvable reasons are kept in the state file and retried on later
+    // shards / at finalize, when the missing condition concept may have arrived.
+    const reasonCandidates: [string, string][] = [...state.pending_edges.reason_for, ...encounterReasons];
+    const pendingReasons: [string, string][] = [];
     let reasonForCount = 0;
-    for (const [encId, condCode] of encounterReasons) {
-      if (conceptConditions.has(condCode)) {
+    for (const [encId, condCode] of reasonCandidates) {
+      if (conceptConditions.has(condCode) || knownConditions.has(condCode)) {
         writeCsvLine(reasonForWriter, [encId, condCode]);
         reasonForCount++;
+      } else {
+        pendingReasons.push([encId, condCode]);
       }
     }
-    console.log(`  REASON_FOR edges: ${reasonForCount} (of ${encounterReasons.length} encounter reasons)`);
+    state.pending_edges.reason_for = pendingReasons;
+    console.log(`  REASON_FOR edges: ${reasonForCount} (of ${reasonCandidates.length} encounter reasons, ${pendingReasons.length} pending)`);
 
     // Close all writers
     for (const w of [patWriter, encWriter, diagWriter, prescWriter, resultWriter,
@@ -454,74 +619,106 @@ async function ingest() {
     for (const p of conceptProcedures.values()) cpLines.push([p.code, p.system, p.description].map(escapeCsv).join(','));
     writeFileSync(cpFile, cpLines.join('\n'), 'utf-8');
 
-    // Cross-concept CSVs
+    // Cross-concept CSVs. In append mode these edges are NOT written to the DB
+    // (COPY would duplicate pairs already loaded); the observed pairs are
+    // accumulated in the state file and resolved once at --finalize against the
+    // cumulative concept set.
     const treatsFile = join(TMP_DIR, 'treats.csv');
-    const treatsLines = ['med_code,cond_code'];
-    for (const [medCode, condCodes] of medTreats) {
-      for (const condCode of condCodes) {
-        // Only include if both codes exist as concepts
-        if (conceptConditions.has(condCode)) {
-          treatsLines.push([medCode, condCode].map(escapeCsv).join(','));
-        }
-      }
-    }
-    writeFileSync(treatsFile, treatsLines.join('\n'), 'utf-8');
-    console.log(`  TREATS edges: ${treatsLines.length - 1}`);
-
     const indicatedByFile = join(TMP_DIR, 'indicated_by.csv');
-    const indicatedByLines = ['proc_code,cond_code'];
-    for (const [procCode, condCodes] of procIndicatedBy) {
-      for (const condCode of condCodes) {
-        if (conceptConditions.has(condCode)) {
-          indicatedByLines.push([procCode, condCode].map(escapeCsv).join(','));
+    const complicationOfFile = join(TMP_DIR, 'complication_of.csv');
+
+    const writtenTreats = new Set(state.written_edges.treats);
+    const writtenIndicated = new Set(state.written_edges.indicated_by);
+    const pendingTreats = new Set(state.pending_edges.treats);
+    const pendingIndicated = new Set(state.pending_edges.indicated_by);
+
+    if (appendMode) {
+      for (const [medCode, condCodes] of medTreats) {
+        for (const condCode of condCodes) {
+          const key = `${medCode}|${condCode}`;
+          if (!writtenTreats.has(key)) pendingTreats.add(key);
         }
       }
-    }
-    writeFileSync(indicatedByFile, indicatedByLines.join('\n'), 'utf-8');
-    console.log(`  INDICATED_BY edges: ${indicatedByLines.length - 1}`);
-
-    // COMPLICATION_OF edges from the curated SNOMED-CT map. Previous versions
-    // used a word-overlap heuristic (≥50% token overlap between child desc and
-    // extracted "due to" phrase) — dropped in favor of hand-verified pairs that
-    // actually match SNOMED hierarchy or disease-causation semantics.
-    const complicationOfFile = join(TMP_DIR, 'complication_of.csv');
-    const complicationOfLines = ['complication_code,parent_code'];
-    let complicationDropped = 0;
-    for (const edge of COMPLICATION_EDGES) {
-      // Both codes must exist as concepts in this tier's cohort
-      if (!conceptConditions.has(edge.childCode) || !conceptConditions.has(edge.parentCode)) {
-        complicationDropped++;
-        continue;
+      for (const [procCode, condCodes] of procIndicatedBy) {
+        for (const condCode of condCodes) {
+          const key = `${procCode}|${condCode}`;
+          if (!writtenIndicated.has(key)) pendingIndicated.add(key);
+        }
       }
-      complicationOfLines.push([edge.childCode, edge.parentCode].map(escapeCsv).join(','));
+      state.pending_edges.treats = [...pendingTreats];
+      state.pending_edges.indicated_by = [...pendingIndicated];
+      console.log(`  Cross-concept edges deferred to finalize: ${pendingTreats.size} TREATS, ${pendingIndicated.size} INDICATED_BY pending`);
+    } else {
+      const treatsLines = ['med_code,cond_code'];
+      for (const [medCode, condCodes] of medTreats) {
+        for (const condCode of condCodes) {
+          const key = `${medCode}|${condCode}`;
+          if (conceptConditions.has(condCode)) {
+            treatsLines.push([medCode, condCode].map(escapeCsv).join(','));
+            writtenTreats.add(key);
+          } else {
+            pendingTreats.add(key);
+          }
+        }
+      }
+      writeFileSync(treatsFile, treatsLines.join('\n'), 'utf-8');
+      console.log(`  TREATS edges: ${treatsLines.length - 1}`);
+
+      const indicatedByLines = ['proc_code,cond_code'];
+      for (const [procCode, condCodes] of procIndicatedBy) {
+        for (const condCode of condCodes) {
+          const key = `${procCode}|${condCode}`;
+          if (conceptConditions.has(condCode)) {
+            indicatedByLines.push([procCode, condCode].map(escapeCsv).join(','));
+            writtenIndicated.add(key);
+          } else {
+            pendingIndicated.add(key);
+          }
+        }
+      }
+      writeFileSync(indicatedByFile, indicatedByLines.join('\n'), 'utf-8');
+      console.log(`  INDICATED_BY edges: ${indicatedByLines.length - 1}`);
+
+      // COMPLICATION_OF edges from the curated SNOMED-CT map. Previous versions
+      // used a word-overlap heuristic (≥50% token overlap between child desc and
+      // extracted "due to" phrase) — dropped in favor of hand-verified pairs that
+      // actually match SNOMED hierarchy or disease-causation semantics.
+      const complicationOfLines = ['complication_code,parent_code'];
+      let complicationDropped = 0;
+      for (const edge of COMPLICATION_EDGES) {
+        // Both codes must exist as concepts in this tier's cohort
+        if (!conceptConditions.has(edge.childCode) || !conceptConditions.has(edge.parentCode)) {
+          complicationDropped++;
+          continue;
+        }
+        complicationOfLines.push([edge.childCode, edge.parentCode].map(escapeCsv).join(','));
+        state.written_edges.complication_of.push(`${edge.childCode}|${edge.parentCode}`);
+      }
+      writeFileSync(complicationOfFile, complicationOfLines.join('\n'), 'utf-8');
+      console.log(`  COMPLICATION_OF edges: ${complicationOfLines.length - 1} (${complicationDropped} map entries skipped — parent/child not in cohort)`);
+
+      state.pending_edges.treats = [...pendingTreats];
+      state.pending_edges.indicated_by = [...pendingIndicated];
+      state.written_edges.treats = [...writtenTreats];
+      state.written_edges.indicated_by = [...writtenIndicated];
     }
-    writeFileSync(complicationOfFile, complicationOfLines.join('\n'), 'utf-8');
-    console.log(`  COMPLICATION_OF edges: ${complicationOfLines.length - 1} (${complicationDropped} map entries skipped — parent/child not in cohort)`);
 
     // Small delay to let file streams flush
     await new Promise((r) => setTimeout(r, 500));
 
     // ── 4. Create schema ────────────────────────────────────────────────
 
-    console.log('\nCreating schema...');
     await conn.query('LOAD EXTENSION fts');
 
     // FTS indexes block DROP TABLE on the node they reference — drop them first.
-    // (The list mirrors the CREATE_FTS_INDEX calls at the end of ingest.)
-    const ftsIndexesToDrop: [string, string][] = [
-      ['Patient', 'patient_fts'],
-      ['ConceptCondition', 'condition_fts'],
-      ['ConceptMedication', 'medication_fts'],
-      ['ConceptObservation', 'observation_fts'],
-      ['ConceptProcedure', 'procedure_fts'],
-      ['Provider', 'provider_fts'],
-      ['Organization', 'organization_fts'],
-    ];
-    for (const [table, index] of ftsIndexesToDrop) {
-      try {
-        await conn.query(`CALL DROP_FTS_INDEX('${table}', '${index}')`);
-      } catch { /* may not exist */ }
-    }
+    // Also dropped in append mode: COPY into an FTS-indexed table is unsafe, so
+    // appends always leave FTS teardown here and rebuilding to --finalize.
+    await dropFtsIndexes(conn);
+
+    if (appendMode) {
+      console.log('\nAppend mode: existing schema retained.');
+    } else {
+    console.log('\nCreating schema...');
 
     // Drop everything — query all tables and drop them
     // First drop all relationship tables, then all node tables
@@ -640,21 +837,26 @@ async function ingest() {
     await conn.query('CREATE REL TABLE COMPLICATION_OF (FROM ConceptCondition TO ConceptCondition, MANY_MANY)');
 
     console.log('Schema created.');
+    }
 
     // ── 5. Bulk load ────────────────────────────────────────────────────
 
     console.log('\nBulk loading nodes...');
     const nodeLoads = [
-      { table: 'ConceptCondition', file: ccFile },
-      { table: 'ConceptMedication', file: cmFile },
-      { table: 'ConceptObservation', file: coFile },
-      { table: 'ConceptProcedure', file: cpFile },
-      { table: 'Organization', file: orgFile },
-      { table: 'Provider', file: provFile },
-      { table: 'Patient', file: join(TMP_DIR, 'patients.csv') },
-      { table: 'Encounter', file: join(TMP_DIR, 'encounters.csv') },
+      { table: 'ConceptCondition', file: ccFile, rows: conceptConditions.size },
+      { table: 'ConceptMedication', file: cmFile, rows: conceptMedications.size },
+      { table: 'ConceptObservation', file: coFile, rows: conceptObservations.size },
+      { table: 'ConceptProcedure', file: cpFile, rows: conceptProcedures.size },
+      { table: 'Organization', file: orgFile, rows: organizations.length },
+      { table: 'Provider', file: provFile, rows: providers.length },
+      { table: 'Patient', file: join(TMP_DIR, 'patients.csv'), rows: patientCount },
+      { table: 'Encounter', file: join(TMP_DIR, 'encounters.csv'), rows: encCount },
     ];
-    for (const { table, file } of nodeLoads) {
+    for (const { table, file, rows } of nodeLoads) {
+      if (rows === 0) {
+        console.log(`  ${table}: skipped (no new rows)`);
+        continue;
+      }
       const t0 = Date.now();
       await conn.query(`COPY ${table} FROM '${file}' (header=true)`);
       console.log(`  ${table}: ${Date.now() - t0}ms`);
@@ -669,10 +871,12 @@ async function ingest() {
       { table: 'HAD_ENCOUNTER', file: join(TMP_DIR, 'had_encounter.csv') },
       { table: 'TREATED_BY', file: join(TMP_DIR, 'treated_by.csv') },
       { table: 'AT_ORGANIZATION', file: join(TMP_DIR, 'at_organization.csv') },
-      { table: 'TREATS', file: treatsFile },
-      { table: 'INDICATED_BY', file: indicatedByFile },
+      ...(appendMode ? [] : [
+        { table: 'TREATS', file: treatsFile },
+        { table: 'INDICATED_BY', file: indicatedByFile },
+        { table: 'COMPLICATION_OF', file: complicationOfFile },
+      ]),
       { table: 'REASON_FOR', file: join(TMP_DIR, 'reason_for.csv') },
-      { table: 'COMPLICATION_OF', file: complicationOfFile },
     ];
     for (const { table, file } of relLoads) {
       const t0 = Date.now();
@@ -680,34 +884,62 @@ async function ingest() {
       console.log(`  ${table}: ${Date.now() - t0}ms`);
     }
 
-    // AFFILIATED_WITH (provider→org) — built via Cypher join since providers have org IDs
-    console.log('\nCreating AFFILIATED_WITH edges...');
-    const affT0 = Date.now();
-    await conn.query(`MATCH (prov:Provider), (org:Organization)
-                      WHERE prov.organization_id = org.organization_id
-                      CREATE (prov)-[:AFFILIATED_WITH]->(org)`);
-    console.log(`  done in ${Date.now() - affT0}ms`);
+    if (!appendMode) {
+      // AFFILIATED_WITH (provider→org) — built via Cypher join since providers have org IDs
+      console.log('\nCreating AFFILIATED_WITH edges...');
+      const affT0 = Date.now();
+      await conn.query(`MATCH (prov:Provider), (org:Organization)
+                        WHERE prov.organization_id = org.organization_id
+                        CREATE (prov)-[:AFFILIATED_WITH]->(org)`);
+      console.log(`  done in ${Date.now() - affT0}ms`);
+    } else if (providers.length > 0) {
+      console.log('\nCreating AFFILIATED_WITH edges for new providers...');
+      await conn.query(`COPY AFFILIATED_WITH FROM '${affiliatedFile}' (header=true)`);
+      console.log(`  ${providers.length} edges`);
+    }
 
     // ── 6. FTS indexes ──────────────────────────────────────────────────
 
-    console.log('\nRebuilding FTS indexes...');
-    const ftsIndexes = [
-      `CALL CREATE_FTS_INDEX('Patient', 'patient_fts', ['first_name', 'last_name', 'city'])`,
-      `CALL CREATE_FTS_INDEX('ConceptCondition', 'condition_fts', ['description', 'code'])`,
-      `CALL CREATE_FTS_INDEX('ConceptMedication', 'medication_fts', ['description', 'code'])`,
-      `CALL CREATE_FTS_INDEX('ConceptObservation', 'observation_fts', ['description', 'code'])`,
-      `CALL CREATE_FTS_INDEX('ConceptProcedure', 'procedure_fts', ['description', 'code'])`,
-      `CALL CREATE_FTS_INDEX('Provider', 'provider_fts', ['name', 'specialty'])`,
-      `CALL CREATE_FTS_INDEX('Organization', 'organization_fts', ['name', 'city'])`,
-    ];
-    for (const stmt of ftsIndexes) {
-      try { await conn.query(stmt); } catch { /* may already exist */ }
+    if (appendMode || skipFts) {
+      console.log('\nFTS indexes deferred (build them with --finalize).');
+    } else {
+      console.log('\nRebuilding FTS indexes...');
+      await createFtsIndexes(conn);
+      console.log('FTS indexes created.');
     }
-    console.log('FTS indexes created.');
 
-    // ── 7. Provenance manifest ──────────────────────────────────────────
+    // ── 7. Cross-shard state + provenance manifest ──────────────────────
 
-    console.log('\nWriting provenance manifest...');
+    state.concepts = {
+      conditions: [...knownConditions, ...conceptConditions.keys()],
+      medications: [...knownMedications, ...conceptMedications.keys()],
+      observations: [...knownObservations, ...conceptObservations.keys()],
+      procedures: [...knownProcedures, ...conceptProcedures.keys()],
+    };
+    state.totals.patients += patientCount;
+    state.totals.encounters += encCount;
+    state.totals.conditions += condCount;
+    state.totals.medications += medCount;
+    state.totals.observations += obsCount;
+    state.totals.procedures += procCount;
+    if (appendMode) {
+      state.totals.providers += providers.length;
+      state.totals.organizations += organizations.length;
+    } else {
+      state.totals.providers = providers.length;
+      state.totals.organizations = organizations.length;
+    }
+    state.written_edges.reason_for += reasonForCount;
+    state.shards.push({
+      source: SOURCE_PATH,
+      timestamp: new Date().toISOString(),
+      patients: patientCount,
+      encounters: encCount,
+    });
+    saveState(state);
+    console.log(`\nIngest state saved: ${STATE_PATH}`);
+
+    console.log('Writing provenance manifest...');
 
     // Git SHA (best-effort — tolerates missing git / detached worktree)
     let gitSha = "unknown";
@@ -719,39 +951,46 @@ async function ingest() {
 
     // Source file metadata (Synthea version isn't embedded in the data, so we
     // record the file's mtime + size as a weaker fingerprint)
-    const patientsPath = join(GEN_DIR, 'patients.json');
-    const patientsStat = existsSync(patientsPath) ? statSync(patientsPath) : null;
+    const patientsStat = existsSync(SOURCE_PATH) ? statSync(SOURCE_PATH) : null;
 
     const manifest = {
       ingest_timestamp: new Date().toISOString(),
       tier: tierFlag ?? "full",
+      mode: appendMode ? 'append' : 'full',
       db_path: DB_PATH,
       git: { sha: gitSha, dirty: gitDirty },
       source: {
-        patients_json: patientsPath,
+        patients_json: SOURCE_PATH,
         patients_json_mtime: patientsStat?.mtime.toISOString() ?? null,
         patients_json_bytes: patientsStat?.size ?? null,
       },
+      as_of_date: ingestDateIso,
       counts: {
-        patients: patientCount,
-        encounters: encCount,
-        providers: providers.length,
-        organizations: organizations.length,
-        concept_conditions: conceptConditions.size,
-        concept_medications: conceptMedications.size,
-        concept_observations: conceptObservations.size,
-        concept_procedures: conceptProcedures.size,
-        condition_instances: condCount,
-        medication_instances: medCount,
-        observation_instances: obsCount,
-        procedure_instances: procCount,
+        patients: state.totals.patients,
+        encounters: state.totals.encounters,
+        providers: state.totals.providers,
+        organizations: state.totals.organizations,
+        concept_conditions: state.concepts.conditions.length,
+        concept_medications: state.concepts.medications.length,
+        concept_observations: state.concepts.observations.length,
+        concept_procedures: state.concepts.procedures.length,
+        condition_instances: state.totals.conditions,
+        medication_instances: state.totals.medications,
+        observation_instances: state.totals.observations,
+        procedure_instances: state.totals.procedures,
       },
       derived_edges: {
-        treats: treatsLines.length - 1,
-        indicated_by: indicatedByLines.length - 1,
-        complication_of: complicationOfLines.length - 1,
-        reason_for: reasonForCount,
+        treats: state.written_edges.treats.length,
+        indicated_by: state.written_edges.indicated_by.length,
+        complication_of: state.written_edges.complication_of.length,
+        reason_for: state.written_edges.reason_for,
       },
+      pending_edges: {
+        treats: state.pending_edges.treats.length,
+        indicated_by: state.pending_edges.indicated_by.length,
+        reason_for: state.pending_edges.reason_for.length,
+      },
+      shards: state.shards.length,
       elapsed_seconds: (Date.now() - startTime) / 1000,
     };
 
@@ -771,9 +1010,9 @@ async function ingest() {
       ["tier", manifest.tier],
       ["git_sha", gitSha],
       ["git_dirty", String(gitDirty)],
-      ["patient_count", String(patientCount)],
-      ["encounter_count", String(encCount)],
-      ["concept_count", String(conceptConditions.size + conceptMedications.size + conceptObservations.size + conceptProcedures.size)],
+      ["patient_count", String(state.totals.patients)],
+      ["encounter_count", String(state.totals.encounters)],
+      ["concept_count", String(state.concepts.conditions.length + state.concepts.medications.length + state.concepts.observations.length + state.concepts.procedures.length)],
       ["manifest_json", JSON.stringify(manifest)],
     ];
     for (const [key, value] of metaRows) {
@@ -792,9 +1031,11 @@ async function ingest() {
     // ── Done ────────────────────────────────────────────────────────────
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const conceptTotal = state.concepts.conditions.length + state.concepts.medications.length
+      + state.concepts.observations.length + state.concepts.procedures.length;
     console.log(`\nIngestion complete in ${elapsed}s.`);
-    console.log(`  Concept nodes: ${conceptConditions.size + conceptMedications.size + conceptObservations.size + conceptProcedures.size}`);
-    console.log(`  Total nodes: ${conceptConditions.size + conceptMedications.size + conceptObservations.size + conceptProcedures.size + patientCount + encCount + organizations.length + providers.length}`);
+    console.log(`  Concept nodes: ${conceptTotal}`);
+    console.log(`  Total nodes: ${conceptTotal + state.totals.patients + state.totals.encounters + state.totals.organizations + state.totals.providers}`);
 
   } finally {
     await conn.close();
@@ -807,7 +1048,164 @@ async function ingest() {
   }
 }
 
-ingest().catch((err) => {
+async function finalize() {
+  console.log('Finalizing ingest: resolving deferred edges + building FTS...');
+  const startTime = Date.now();
+
+  const state = loadState();
+  if (!state) {
+    console.error(`--finalize requires the ingest state file at ${STATE_PATH}`);
+    process.exit(1);
+  }
+  if (!existsSync(DB_PATH)) {
+    console.error(`--finalize requires an existing DB at ${DB_PATH}`);
+    process.exit(1);
+  }
+
+  mkdirSync(TMP_DIR, { recursive: true });
+  const db = new kuzu.Database(DB_PATH);
+  const conn = new kuzu.Connection(db);
+
+  try {
+    await conn.query('LOAD EXTENSION fts');
+    await dropFtsIndexes(conn);
+
+    const condSet = new Set(state.concepts.conditions);
+    const medSet = new Set(state.concepts.medications);
+    const procSet = new Set(state.concepts.procedures);
+
+    async function flushPairs(
+      label: string, table: string, header: string,
+      pending: string[], written: string[],
+      fromSet: Set<string>,
+    ): Promise<{ written: string[]; pending: string[] }> {
+      const writtenSet = new Set(written);
+      const resolvable: string[] = [];
+      const unresolved: string[] = [];
+      for (const key of pending) {
+        if (writtenSet.has(key)) continue;
+        const [from, to] = key.split('|');
+        if (fromSet.has(from) && condSet.has(to)) {
+          resolvable.push(key);
+        } else {
+          unresolved.push(key);
+        }
+      }
+      if (resolvable.length > 0) {
+        const file = join(TMP_DIR, `finalize_${table.toLowerCase()}.csv`);
+        const lines = [header];
+        for (const key of resolvable) {
+          const [from, to] = key.split('|');
+          lines.push([from, to].map(escapeCsv).join(','));
+        }
+        writeFileSync(file, lines.join('\n'), 'utf-8');
+        await conn.query(`COPY ${table} FROM '${file}' (header=true)`);
+      }
+      console.log(`  ${label}: ${resolvable.length} written, ${unresolved.length} unresolved (dropped)`);
+      return { written: [...writtenSet, ...resolvable], pending: [] };
+    }
+
+    const treatsResult = await flushPairs('TREATS', 'TREATS', 'med_code,cond_code',
+      state.pending_edges.treats, state.written_edges.treats, medSet);
+    state.written_edges.treats = treatsResult.written;
+    state.pending_edges.treats = treatsResult.pending;
+
+    const indicatedResult = await flushPairs('INDICATED_BY', 'INDICATED_BY', 'proc_code,cond_code',
+      state.pending_edges.indicated_by, state.written_edges.indicated_by, procSet);
+    state.written_edges.indicated_by = indicatedResult.written;
+    state.pending_edges.indicated_by = indicatedResult.pending;
+
+    const writtenComplications = new Set(state.written_edges.complication_of);
+    const newComplications: string[] = [];
+    for (const edge of COMPLICATION_EDGES) {
+      const key = `${edge.childCode}|${edge.parentCode}`;
+      if (writtenComplications.has(key)) continue;
+      if (condSet.has(edge.childCode) && condSet.has(edge.parentCode)) {
+        newComplications.push(key);
+      }
+    }
+    if (newComplications.length > 0) {
+      const file = join(TMP_DIR, 'finalize_complication_of.csv');
+      const lines = ['complication_code,parent_code'];
+      for (const key of newComplications) {
+        const [child, parent] = key.split('|');
+        lines.push([child, parent].map(escapeCsv).join(','));
+      }
+      writeFileSync(file, lines.join('\n'), 'utf-8');
+      await conn.query(`COPY COMPLICATION_OF FROM '${file}' (header=true)`);
+      state.written_edges.complication_of.push(...newComplications);
+    }
+    console.log(`  COMPLICATION_OF: ${newComplications.length} new edges written (${state.written_edges.complication_of.length} total)`);
+
+    const pendingReasons: [string, string][] = [];
+    const resolvableReasons: [string, string][] = [];
+    for (const [encId, condCode] of state.pending_edges.reason_for) {
+      if (condSet.has(condCode)) {
+        resolvableReasons.push([encId, condCode]);
+      } else {
+        pendingReasons.push([encId, condCode]);
+      }
+    }
+    if (resolvableReasons.length > 0) {
+      const file = join(TMP_DIR, 'finalize_reason_for.csv');
+      const lines = ['encounter_id,code'];
+      for (const [encId, condCode] of resolvableReasons) {
+        lines.push([encId, condCode].map(escapeCsv).join(','));
+      }
+      writeFileSync(file, lines.join('\n'), 'utf-8');
+      await conn.query(`COPY REASON_FOR FROM '${file}' (header=true)`);
+      state.written_edges.reason_for += resolvableReasons.length;
+    }
+    state.pending_edges.reason_for = [];
+    console.log(`  REASON_FOR: ${resolvableReasons.length} resolved, ${pendingReasons.length} unresolved (dropped)`);
+
+    console.log('\nBuilding FTS indexes...');
+    await createFtsIndexes(conn);
+    console.log('FTS indexes created.');
+
+    saveState(state);
+
+    const manifestPath = join(GEN_DIR, tierFlag ? `manifest-${tierFlag}.json` : 'manifest.json');
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+      manifest.finalize_timestamp = new Date().toISOString();
+      manifest.derived_edges = {
+        treats: state.written_edges.treats.length,
+        indicated_by: state.written_edges.indicated_by.length,
+        complication_of: state.written_edges.complication_of.length,
+        reason_for: state.written_edges.reason_for,
+      };
+      manifest.pending_edges = { treats: 0, indicated_by: 0, reason_for: 0 };
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), 'utf-8');
+      console.log(`  Manifest updated: ${manifestPath}`);
+    }
+
+    const metaRows: [string, string][] = [
+      ["finalize_timestamp", new Date().toISOString()],
+      ["patient_count", String(state.totals.patients)],
+      ["encounter_count", String(state.totals.encounters)],
+      ["concept_count", String(state.concepts.conditions.length + state.concepts.medications.length + state.concepts.observations.length + state.concepts.procedures.length)],
+    ];
+    for (const [key, value] of metaRows) {
+      try {
+        const prep = await conn.prepare(`MERGE (m:Metadata {key: $key}) SET m.value = $value`);
+        await conn.execute(prep, { key, value });
+      } catch { /* Metadata table may not exist in pre-state DBs */ }
+    }
+
+    console.log(`\nFinalize complete in ${((Date.now() - startTime) / 1000).toFixed(1)}s.`);
+    console.log(`  Cumulative: ${state.totals.patients} patients, ${state.totals.encounters} encounters, ${state.shards.length} shard(s)`);
+  } finally {
+    await conn.close();
+    await db.close();
+    if (existsSync(TMP_DIR)) {
+      rmSync(TMP_DIR, { recursive: true });
+    }
+  }
+}
+
+const entry = finalizeMode ? finalize : ingest;
+entry().catch((err) => {
   console.error('Ingestion failed:', err);
   process.exit(1);
 });

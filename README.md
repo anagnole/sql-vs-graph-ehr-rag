@@ -4,9 +4,6 @@ Companion code and data for the paper **"Knowledge Graphs vs. SQL Over Structure
 
 A controlled benchmark comparing **five retrieval approaches** for clinical question answering over Synthea EHRs, evaluated across **three models** and **three nested cohort sizes**.
 
-[![Demo](docs/demo-screenshot.png)](https://youtu.be/X7BhfGabk70)
-> **[Watch the clinical-assistant demo](https://youtu.be/X7BhfGabk70)** — Streaming chat with graph retrieval, document generation, and multi-model support.
-
 ## Experimental design
 
 - **334 questions** across six categories (simple-lookup, multi-hop, temporal, cohort, reasoning, unanswerable)
@@ -143,20 +140,16 @@ The graph-retrieval approach exposes 18 clinical tools to the LLM via the Model 
 | `aggregate_observation_for_cohort` | Statistics for a lab/vital across a group |
 | `list_treatments_for_condition` | Common medications for a diagnosis |
 
+These tools are self-contained — they run Cypher directly against the local Kuzu DB (`src/api/tools.ts`). Two stdio MCP launchers back the eval baselines, each reading `KUZU_DB_PATH`/`PG_DSN` from the environment so the runner can point them at any tier:
+
 ```bash
-./start-mcp.sh
+./start-mcp-cypher.sh     # single run_cypher tool (text-to-Cypher eval baseline)
+./start-mcp-sql.sh        # single run_sql tool (text-to-SQL eval baseline, needs PostgreSQL)
 ```
 
 ## Clinical-assistant UI
 
-A doctor-facing chat interface with an interactive Sigma.js knowledge-graph view, used for the qualitative parts of the work (not the paper's quantitative benchmark).
-
-```bash
-npm run ui:dev                     # hot-reload dev server
-npm run ui                         # production build
-```
-
-Features: model selector (Claude / Qwen / Llama via OpenRouter), streaming chat with tool-call visibility, force-directed knowledge graph, node-click context attachment, date filtering, document generation (referral letters, SOAP notes), clinical templates.
+The doctor-facing chat + interactive knowledge-graph interface (the qualitative demo, not part of this paper's quantitative benchmark) lives in its own repository: **[ehr-clinical-assistant](https://github.com/anagnole/ehr-clinical-assistant)**. It reuses the graph tool layer (`src/api/tools.ts`) shipped here and bundles a ready-to-run 200-patient database.
 
 ## Repository layout
 
@@ -179,10 +172,12 @@ Features: model selector (Claude / Qwen / Llama via OpenRouter), streaming chat 
 │   ├── questions/        # Generators for the 6 question categories
 │   ├── eval/             # Evaluation runner, LLM-as-judge scorer
 │   ├── prompt/           # System prompts per retrieval approach
-│   ├── api/              # Fastify API + Kuzu client + MCP tools
-│   └── ui/               # React + Sigma.js clinical UI
+│   ├── api/              # Kuzu client + 18 EHR tools (the graph paradigm)
+│   ├── mcp-cypher/       # Local MCP server: run_cypher (eval baseline)
+│   └── mcp-sql/          # Local MCP server: run_sql (eval baseline)
 ├── docker-compose.yml    # PostgreSQL 16
-├── start-mcp.sh          # MCP server launcher
+├── start-mcp-cypher.sh   # Cypher-baseline MCP launcher
+├── start-mcp-sql.sh      # SQL-baseline MCP launcher
 └── package.json
 ```
 
@@ -195,7 +190,6 @@ Features: model selector (Claude / Qwen / Llama via OpenRouter), streaming chat 
 - **MCP** — Model Context Protocol for the curated-graph approach
 - **Synthea** — synthetic patient generation (seed 42)
 - **Python 3 / pandas / scipy / seaborn** — statistical analysis and plotting
-- **Fastify + React + Sigma.js** — clinical UI
 
 ## Citation
 

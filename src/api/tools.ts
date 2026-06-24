@@ -833,31 +833,12 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
       `MATCH (p:Patient {patient_id: $id})-[r:HAS_RESULT]->(o:ConceptObservation)
        WHERE ${wherePieces.join(" AND ")}
        RETURN o.description AS description, o.code AS code,
-              r.value AS value, r.units AS units,
-              r.value_canonical AS value_canonical, r.units_canonical AS units_canonical,
-              o.normal_low AS normal_low, o.normal_high AS normal_high,
-              o.critical_low AS critical_low, o.critical_high AS critical_high,
+              r.value AS value, r.units AS units, o.category AS category,
               r.date AS date
        ORDER BY r.date DESC LIMIT 50`,
       params,
     );
-    // Flag each lab as normal/high/low/critical based on canonical value vs range.
-    return rows.map((r) => {
-      const vc = r.value_canonical as number | null;
-      const nl = r.normal_low as number | null;
-      const nh = r.normal_high as number | null;
-      const cl = r.critical_low as number | null;
-      const ch = r.critical_high as number | null;
-      let flag: string | null = null;
-      if (typeof vc === "number" && Number.isFinite(vc)) {
-        if (cl != null && vc < cl) flag = "critical_low";
-        else if (ch != null && vc > ch) flag = "critical_high";
-        else if (nl != null && vc < nl) flag = "low";
-        else if (nh != null && vc > nh) flag = "high";
-        else if (nl != null || nh != null) flag = "normal";
-      }
-      return { ...r, flag };
-    });
+    return rows;
   },
 
   async get_procedures(args) {
@@ -970,31 +951,23 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
     }
 
     // Pull all (patient, value, date) tuples for cohort+observation, find latest per patient in JS.
-    // Prefer r.value_canonical (unit-normalized at ingest) when present — avoids
-    // silently mixing mg/dL and mmol/L across the cohort. Falls back to parsing
-    // the raw string value for labs not in the LOINC normalization table.
     const rows = await q(
       `MATCH (p:Patient)-[:DIAGNOSED_WITH]->(c:ConceptCondition)
        WHERE LOWER(c.description) CONTAINS LOWER($condition)
        MATCH (p)-[r:HAS_RESULT]->(o:ConceptObservation)
        WHERE ${obsFilter}
        RETURN p.patient_id AS pid, r.value AS value, r.units AS units,
-              r.value_canonical AS vc, r.units_canonical AS uc,
               r.date AS date, o.description AS description`,
       { condition, ...obsParams },
     );
 
-    interface Latest { value: number; units: string; desc: string; date: string; canonical: boolean }
+    interface Latest { value: number; units: string; desc: string; date: string }
     const latestByPatient = new Map<string, Latest>();
     for (const row of rows) {
       const pid = row.pid as string;
-      const vc = row.vc;
-      const hasCanonical = typeof vc === "number" && Number.isFinite(vc);
-      const value = hasCanonical
-        ? (vc as number)
-        : typeof row.value === "number" ? row.value : parseFloat(String(row.value ?? ""));
+      const value = typeof row.value === "number" ? row.value : parseFloat(String(row.value ?? ""));
       if (!Number.isFinite(value)) continue;
-      const units = hasCanonical ? String(row.uc ?? "") : String(row.units ?? "");
+      const units = String(row.units ?? "");
       const date = String(row.date ?? "");
       const existing = latestByPatient.get(pid);
       if (!existing || date > existing.date) {
@@ -1002,11 +975,9 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
           value, units,
           desc: String(row.description ?? ""),
           date,
-          canonical: hasCanonical,
         });
       }
     }
-    const canonicalCount = [...latestByPatient.values()].filter((l) => l.canonical).length;
 
     const values = Array.from(latestByPatient.values()).map(v => v.value);
     if (values.length === 0) {
@@ -1053,7 +1024,6 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
     return {
       cohort_size: cohortSize,
       patients_with_observation: latestByPatient.size,
-      patients_with_canonical_units: canonicalCount,
       aggregation: agg,
       value: Math.round(result * 100) / 100,
       units: sample.units || null,
@@ -1097,34 +1067,28 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
       : "LOWER(o.description) CONTAINS LOWER($obsDesc)";
     const obsParams = obsCode ? { obsCode } : { obsDesc };
 
-    // Pull (patient, value, date) tuples, latest-per-patient in JS. Prefer
-    // value_canonical when available (same rationale as aggregate_observation_for_cohort).
+    // Pull (patient, value, date) tuples, latest-per-patient in JS.
     const rows = await q(
       `MATCH (p:Patient)-[:DIAGNOSED_WITH]->(c:ConceptCondition)
        WHERE LOWER(c.description) CONTAINS LOWER($condition)
        MATCH (p)-[r:HAS_RESULT]->(o:ConceptObservation)
        WHERE ${obsFilter}
        RETURN p.patient_id AS pid, r.value AS value, r.units AS units,
-              r.value_canonical AS vc, r.units_canonical AS uc,
               r.date AS date, o.description AS description`,
       { condition, ...obsParams },
     );
 
-    interface Latest { value: number; units: string; desc: string; date: string; canonical: boolean }
+    interface Latest { value: number; units: string; desc: string; date: string }
     const latest = new Map<string, Latest>();
     for (const row of rows) {
       const pid = row.pid as string;
-      const vc = row.vc;
-      const hasCanonical = typeof vc === "number" && Number.isFinite(vc);
-      const value = hasCanonical
-        ? (vc as number)
-        : typeof row.value === "number" ? row.value : parseFloat(String(row.value ?? ""));
+      const value = typeof row.value === "number" ? row.value : parseFloat(String(row.value ?? ""));
       if (!Number.isFinite(value)) continue;
-      const units = hasCanonical ? String(row.uc ?? "") : String(row.units ?? "");
+      const units = String(row.units ?? "");
       const d = String(row.date ?? "");
       const existing = latest.get(pid);
       if (!existing || d > existing.date) {
-        latest.set(pid, { value, units, desc: String(row.description ?? ""), date: d, canonical: hasCanonical });
+        latest.set(pid, { value, units, desc: String(row.description ?? ""), date: d });
       }
     }
 
@@ -1185,21 +1149,11 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
     const rows = await q(
       `MATCH (:Patient {patient_id: $id})-[r:HAS_RESULT]->(o:ConceptObservation {code: $code})
        RETURN r.value AS value, r.units AS units,
-              r.value_canonical AS vc, r.units_canonical AS uc,
               r.date AS date, o.description AS description
        ORDER BY r.date ASC`,
       { id, code },
     );
     if (rows.length === 0) return { error: `No observations with code ${code} found for patient ${id}` };
-    // Per-row: prefer canonical value/units so a patient with a mix of mg/dL
-    // and mmol/L readings compares on the same scale.
-    for (const r of rows) {
-      const vc = r.vc;
-      if (typeof vc === "number" && Number.isFinite(vc)) {
-        r.value = vc;
-        r.units = r.uc ?? r.units;
-      }
-    }
     if (rows.length === 1) {
       return {
         single_value: true,
@@ -1437,8 +1391,7 @@ const executors: Record<string, (args: ToolArgs) => Promise<unknown>> = {
          { eid }),
       q(`MATCH (:Patient)-[r:HAS_RESULT {encounter_id: $eid}]->(o:ConceptObservation)
          RETURN o.code AS code, o.description AS description,
-                r.value AS value, r.units AS units, r.value_canonical AS value_canonical,
-                r.units_canonical AS units_canonical, r.date AS date`,
+                r.value AS value, r.units AS units, r.date AS date`,
          { eid }),
       q(`MATCH (:Patient)-[r:UNDERWENT {encounter_id: $eid}]->(pr:ConceptProcedure)
          RETURN pr.code AS code, pr.description AS description,

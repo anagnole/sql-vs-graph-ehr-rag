@@ -14,7 +14,7 @@ function bundlePatient(patientId: string, ds: ParsedDataset) {
   };
 }
 
-async function writePatientBundles(filePath: string, ds: ParsedDataset): Promise<void> {
+export async function writePatientBundles(filePath: string, ds: ParsedDataset): Promise<void> {
   const stream = createWriteStream(filePath);
 
   // Handle backpressure — without this, the sync loop fills the write buffer
