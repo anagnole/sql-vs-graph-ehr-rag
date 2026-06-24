@@ -11,6 +11,9 @@
  */
 
 import pg from 'pg';
+import { spawn } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   spawnClaude,
   buildResponse,
@@ -32,6 +35,7 @@ import {
 } from '../prompt/builder.js';
 import { TOOL_DEFS, executeTool } from '../api/tools.js';
 import { resetMetrics, getMetrics, metricsEnabled, recordTool } from '../api/metrics.js';
+import { denseRetrieve } from './retrieval.js';
 import type { RunResult as _RR } from './types.js';
 
 type Breakdown = NonNullable<_RR['breakdown']>;
@@ -95,10 +99,20 @@ async function callLlm(
     useMcp?: boolean;
     maxTurns?: number;
     mcpConfigOverride?: string;
+    /** Copilot CLI only: restrict the model to exactly these tool names. */
+    availableTools?: string[];
     /** Cancels the underlying subprocess / HTTP call when aborted. */
     signal?: AbortSignal;
   },
-): Promise<{ answer: string; latencyMs: number; llmReportedMs?: number; numTurns?: number; costUsd?: number }> {
+): Promise<{ answer: string; latencyMs: number; llmReportedMs?: number; numTurns?: number; costUsd?: number; outputTokens?: number }> {
+  // Copilot CLI path — official GitHub Copilot CLI in programmatic mode.
+  // Same mediation class as the Claude CLI route: vendor agent harness with
+  // our MCP tools attached. Matched by the "copilot/" model prefix before
+  // registry resolution (Ollama's catch-all would otherwise claim it).
+  if (isCopilotModel(model)) {
+    return callCopilot(prompt, model, opts);
+  }
+
   const provider = registry.resolve(model);
   if (!provider) {
     throw new Error(`No provider found for model: ${model}`);
@@ -125,7 +139,7 @@ async function callClaude(
     /** Kills the Claude CLI subprocess when aborted. */
     signal?: AbortSignal;
   },
-): Promise<{ answer: string; latencyMs: number; llmReportedMs?: number; numTurns?: number; costUsd?: number }> {
+): Promise<{ answer: string; latencyMs: number; llmReportedMs?: number; numTurns?: number; costUsd?: number; outputTokens?: number }> {
   const start = Date.now();
 
   const useCustomMcp = !!opts?.mcpConfigOverride;
@@ -250,6 +264,169 @@ async function callClaude(
   });
 }
 
+const COPILOT_PREFIX = 'copilot/';
+
+export function isCopilotModel(model: string): boolean {
+  return model.startsWith(COPILOT_PREFIX);
+}
+
+interface CopilotEvent {
+  type: string;
+  data?: { content?: unknown; toolRequests?: unknown[]; outputTokens?: unknown; errorType?: unknown; message?: unknown };
+  usage?: { totalApiDurationMs?: unknown; premiumRequests?: unknown };
+  exitCode?: unknown;
+}
+
+async function callCopilot(
+  prompt: string,
+  model: string,
+  opts?: {
+    system?: string;
+    useMcp?: boolean;
+    maxTurns?: number;
+    mcpConfigOverride?: string;
+    availableTools?: string[];
+    signal?: AbortSignal;
+  },
+): Promise<{ answer: string; latencyMs: number; llmReportedMs?: number; numTurns?: number; costUsd?: number; outputTokens?: number }> {
+  const start = Date.now();
+  const copilotModel = model.slice(COPILOT_PREFIX.length);
+
+  // The Copilot CLI has no system-prompt flag; the system instruction is
+  // prepended to the user message with an explicit delimiter. Disclosed in
+  // the methods section alongside the CLI mediation itself.
+  const fullPrompt = opts?.system
+    ? `System instructions:\n${opts.system}\n\nUser request:\n${prompt}`
+    : prompt;
+
+  const mcpConfig = opts?.mcpConfigOverride
+    ?? (opts?.useMcp ? readFileSync(join(PROJECT_DIR, '.mcp.json'), 'utf-8') : '{"mcpServers":{}}');
+
+  const args = [
+    '--output-format', 'json',
+    '--no-color',
+    '--stream', 'off',
+    '--model', copilotModel,
+    '--allow-all-tools',
+    '--additional-mcp-config', mcpConfig,
+  ];
+  // Restrict the model to exactly the approach's tool surface. A bare
+  // `--available-tools` is a no-op (verified: bash stays reachable), so an
+  // explicit list is mandatory. Approaches with no tools get a sentinel name
+  // that matches nothing, leaving the model with zero tools — the CLI's
+  // built-in shell/file tools must never be reachable during eval runs.
+  const availableTools = opts?.availableTools ?? [];
+  args.push(`--available-tools=${availableTools.length > 0 ? availableTools.join(',') : 'eval-no-tools-permitted'}`);
+  args.push('-p', fullPrompt);
+
+  const child = spawn(process.env.COPILOT_PATH ?? 'copilot', args, {
+    cwd: PROJECT_DIR,
+    env: process.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let killedByAbort = false;
+  let killEscalation: NodeJS.Timeout | undefined;
+  const onAbort = () => {
+    killedByAbort = true;
+    try { child.kill('SIGTERM'); } catch { /* already gone */ }
+    killEscalation = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }, 2000);
+  };
+  if (opts?.signal) {
+    if (opts.signal.aborted) onAbort();
+    else opts.signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    let stderr = '';
+    let answer = '';
+    let numTurns = 0;
+    let outputTokens = 0;
+    let llmReportedMs: number | undefined;
+    let premiumRequests: number | undefined;
+    let resultExitCode: number | undefined;
+    let sessionError: string | undefined;
+
+    const handleEvent = (ev: CopilotEvent) => {
+      if (ev.type === 'assistant.turn_start') numTurns++;
+      if (ev.type === 'assistant.message') {
+        if (typeof ev.data?.content === 'string' && ev.data.content) {
+          answer = ev.data.content;
+        }
+        if (typeof ev.data?.outputTokens === 'number') {
+          outputTokens += ev.data.outputTokens;
+        }
+      }
+      if (ev.type === 'session.error') {
+        const kind = typeof ev.data?.errorType === 'string' ? ev.data.errorType : 'unknown';
+        const msg = typeof ev.data?.message === 'string' ? ev.data.message : '';
+        sessionError = `Copilot ${kind}: ${msg.slice(0, 200)}`;
+      }
+      if (ev.type === 'result') {
+        if (typeof ev.usage?.totalApiDurationMs === 'number') llmReportedMs = ev.usage.totalApiDurationMs;
+        if (typeof ev.usage?.premiumRequests === 'number') premiumRequests = ev.usage.premiumRequests;
+        if (typeof ev.exitCode === 'number') resultExitCode = ev.exitCode;
+      }
+    };
+
+    const feed = (chunk: string) => {
+      buffer += chunk;
+      let idx;
+      while ((idx = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line) continue;
+        try { handleEvent(JSON.parse(line) as CopilotEvent); } catch { /* non-JSON noise */ }
+      }
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => feed(chunk.toString()));
+    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+    child.on('close', (code) => {
+      const latencyMs = Date.now() - start;
+      if (killEscalation) clearTimeout(killEscalation);
+      if (opts?.signal) opts.signal.removeEventListener('abort', onAbort);
+
+      const tail = buffer.trim();
+      if (tail) {
+        try { handleEvent(JSON.parse(tail) as CopilotEvent); } catch { /* partial line */ }
+      }
+
+      if (killedByAbort) {
+        reject(new Error(`Killed by abort (exit ${code}, ${latencyMs}ms elapsed)`));
+        return;
+      }
+      if (premiumRequests != null && premiumRequests > 0) {
+        console.error(`[copilot] WARNING: ${model} consumed ${premiumRequests} premium request(s) — not a 0x included model`);
+      }
+      if (code !== 0 || (resultExitCode != null && resultExitCode !== 0)) {
+        const detail = sessionError || stderr.slice(0, 500) || answer.slice(0, 300) || '(no output)';
+        reject(new Error(`Copilot CLI exit ${resultExitCode ?? code}: ${detail}`));
+        return;
+      }
+      if (!answer.trim()) {
+        reject(new Error(`Copilot CLI returned empty answer (stderr: ${stderr.slice(0, 300)})`));
+        return;
+      }
+      resolve({
+        answer: answer.trim(),
+        latencyMs,
+        llmReportedMs,
+        numTurns: numTurns || undefined,
+        outputTokens: outputTokens || undefined,
+      });
+    });
+
+    child.on('error', (err) => {
+      reject(new Error(`Copilot CLI spawn error: ${err.message}`));
+    });
+  });
+}
+
 async function callProvider(
   prompt: string,
   model: string,
@@ -287,17 +464,18 @@ export async function runGraph(q: EvalQuestion, model: string, opts?: { signal?:
   const provider = registry.resolve(model);
   resetMetrics();
 
-  // Claude: use MCP tools via CLI
-  if (provider?.name === 'claude-cli') {
+  // Claude or Copilot: use MCP tools via the vendor CLI
+  if (provider?.name === 'claude-cli' || isCopilotModel(model)) {
     // maxTurns: 20 — empirical tier-200 run showed p95=10 turns, max=17 for
     // successful questions. Previous cap of 5 was enforced by Claude CLI
     // v2.1.97 and caused ~24% of questions (esp. multi-hop and reasoning)
     // to terminate early with error_max_turns. 20 covers the full observed
     // range plus headroom while still capping runaway N+1 loops.
-    const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(withPatientContext(q, q.question), model, {
+    const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(withPatientContext(q, q.question), model, {
       system: SYSTEM_INSTRUCTION,
       useMcp: true,
       maxTurns: 20,
+      availableTools: TOOL_DEFS.map((d) => `thesis-ehr-${d.function.name}`),
       signal: opts?.signal,
     });
     return {
@@ -306,13 +484,13 @@ export async function runGraph(q: EvalQuestion, model: string, opts?: { signal?:
       model,
       answer,
       latencyMs,
-      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
     };
   }
 
   // OpenRouter: OpenAI-compatible tool calling against Kuzu (--hosted path)
   if (provider?.name === 'openrouter') {
-    const { answer, latencyMs } = await callOpenRouterWithTools(
+    const { answer, latencyMs, inputTokens, outputTokens, numTurns } = await callOpenRouterWithTools(
       withPatientContext(q, q.question),
       model,
       { system: SYSTEM_INSTRUCTION, maxRounds: 20, signal: opts?.signal },
@@ -323,7 +501,7 @@ export async function runGraph(q: EvalQuestion, model: string, opts?: { signal?:
       model,
       answer,
       latencyMs,
-      breakdown: buildBreakdown(latencyMs),
+      breakdown: buildBreakdown(latencyMs, { inputTokens, outputTokens, numTurns }),
     };
   }
 
@@ -451,7 +629,7 @@ async function callOpenRouterWithTools(
     tools?: ReadonlyArray<Record<string, unknown>>;
     executor?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   },
-): Promise<{ answer: string; latencyMs: number; costUsd?: number }> {
+): Promise<{ answer: string; latencyMs: number; costUsd?: number; inputTokens?: number; outputTokens?: number; numTurns?: number }> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) throw new Error('OPENROUTER_API_KEY not set — cannot call OpenRouter');
   const maxRounds = opts.maxRounds ?? 20;
@@ -530,6 +708,9 @@ async function callOpenRouterWithTools(
       return {
         answer: (msg.content ?? '').trim(),
         latencyMs: Date.now() - start,
+        inputTokens: totalPromptTokens || undefined,
+        outputTokens: totalCompletionTokens || undefined,
+        numTurns: round + 1,
       };
     }
 
@@ -575,32 +756,61 @@ export async function runSql(q: EvalQuestion, pool: pg.Pool, model: string, opts
   const adapter = new SqlAdapter(pool);
   const context = await buildSqlContext(q, adapter);
   const prompt = withPatientContext(q, `Here is the relevant patient data retrieved via SQL:\n\n${context}\n\nQuestion: ${q.question}`);
-  const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
+  const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
   return {
     questionId: q.id,
     system: 'sql',
     model,
     answer,
     latencyMs,
-    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
   };
 }
 
 // ─── SQL+FTS runner ──────────────────────────────────────────────────────────
+
+// ─── rag-dense (dense vector retrieval baseline) ─────────────────────────────
+// Mirrors sql-fts scoping exactly (patient-anchored summary vs cohort listing);
+// only the selection mechanism differs. Retrieval internals live in
+// src/eval/retrieval.ts; index built by scripts/build-dense-index.ts.
+
+export async function runRagDense(q: EvalQuestion, pool: pg.Pool, model: string, opts?: { signal?: AbortSignal }): Promise<RunResult> {
+  resetMetrics();
+  let context: string;
+  if (q.type === 'cohort' || !q.patientIds || q.patientIds.length === 0) {
+    const adapter = new SqlFtsAdapter(pool);
+    context = await buildSqlContext(q, adapter);
+  } else {
+    const chunks = await denseRetrieve(q.question, q.patientIds[0], 8, opts?.signal);
+    context = chunks.length > 0
+      ? chunks.map((c) => `[${c.section}] ${c.text}`).join('\n\n')
+      : `Patient ${q.patientIds[0]} not found in dense index.`;
+  }
+  const prompt = withPatientContext(q, `Here is the relevant patient data retrieved via dense vector search:\n\n${context}\n\nQuestion: ${q.question}`);
+  const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
+  return {
+    questionId: q.id,
+    system: 'rag-dense',
+    model,
+    answer,
+    latencyMs,
+    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
+  };
+}
 
 export async function runSqlFts(q: EvalQuestion, pool: pg.Pool, model: string, opts?: { signal?: AbortSignal }): Promise<RunResult> {
   resetMetrics();
   const adapter = new SqlFtsAdapter(pool);
   const context = await buildSqlContext(q, adapter);
   const prompt = withPatientContext(q, `Here is the relevant patient data retrieved via SQL+FTS:\n\n${context}\n\nQuestion: ${q.question}`);
-  const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
+  const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
   return {
     questionId: q.id,
     system: 'sql-fts',
     model,
     answer,
     latencyMs,
-    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
   };
 }
 
@@ -621,20 +831,20 @@ export async function runLlmOnly(q: EvalQuestion, model: string, opts?: { signal
   }
 
   const prompt = withPatientContext(q, `Here is the patient record:\n\n${context}\n\nQuestion: ${q.question}`);
-  const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
+  const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(prompt, model, { system: SYSTEM_INSTRUCTION, signal: opts?.signal });
   return {
     questionId: q.id,
     system: 'llm-only',
     model,
     answer,
     latencyMs,
-    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+    breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
   };
 }
 
 // ─── SQL context builder ─────────────────────────────────────────────────────
 
-async function buildSqlContext(q: EvalQuestion, adapter: SqlAdapter): Promise<string> {
+export async function buildSqlContext(q: EvalQuestion, adapter: SqlAdapter): Promise<string> {
   if (q.type === 'cohort') {
     const cohort = await adapter.findCohort({});
     const lines = cohort.map(p =>
@@ -840,24 +1050,25 @@ export async function runGraphCypher(q: EvalQuestion, model: string, opts?: { si
   resetMetrics();
   const provider = registry.resolve(model);
 
-  // Claude path — uses the MCP run_cypher tool via start-mcp-cypher.sh
-  if (provider?.name === 'claude-cli') {
-    const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(withPatientContext(q, q.question), model, {
+  // Claude/Copilot path — uses the MCP run_cypher tool via start-mcp-cypher.sh
+  if (provider?.name === 'claude-cli' || isCopilotModel(model)) {
+    const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(withPatientContext(q, q.question), model, {
       system: CYPHER_T2S_SYSTEM,
       mcpConfigOverride: CYPHER_MCP_CONFIG,
+      availableTools: ['thesis-cypher-run_cypher'],
       maxTurns: 20,
       signal: opts?.signal,
     });
     return {
       questionId: q.id, system: 'graph-cypher', model,
       answer, latencyMs,
-      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
     };
   }
 
   // OpenRouter path
   if (provider?.name === 'openrouter') {
-    const { answer, latencyMs } = await callOpenRouterWithTools(
+    const { answer, latencyMs, inputTokens, outputTokens, numTurns } = await callOpenRouterWithTools(
       withPatientContext(q, q.question),
       model,
       {
@@ -868,7 +1079,7 @@ export async function runGraphCypher(q: EvalQuestion, model: string, opts?: { si
         executor: buildCypherExecutor(),
       },
     );
-    return { questionId: q.id, system: 'graph-cypher', model, answer, latencyMs, breakdown: buildBreakdown(latencyMs) };
+    return { questionId: q.id, system: 'graph-cypher', model, answer, latencyMs, breakdown: buildBreakdown(latencyMs, { inputTokens, outputTokens, numTurns }) };
   }
 
   // Ollama path
@@ -954,24 +1165,25 @@ export async function runSqlT2S(q: EvalQuestion, pool: pg.Pool, model: string, o
   resetMetrics();
   const provider = registry.resolve(model);
 
-  // Claude path — uses the MCP run_sql tool via start-mcp-sql.sh
-  if (provider?.name === 'claude-cli') {
-    const { answer, latencyMs, llmReportedMs, numTurns, costUsd } = await callLlm(withPatientContext(q, q.question), model, {
+  // Claude/Copilot path — uses the MCP run_sql tool via start-mcp-sql.sh
+  if (provider?.name === 'claude-cli' || isCopilotModel(model)) {
+    const { answer, latencyMs, llmReportedMs, numTurns, costUsd, outputTokens } = await callLlm(withPatientContext(q, q.question), model, {
       system: SQL_T2S_SYSTEM,
       mcpConfigOverride: SQL_MCP_CONFIG,
+      availableTools: ['thesis-sql-run_sql'],
       maxTurns: 20,
       signal: opts?.signal,
     });
     return {
       questionId: q.id, system: 'sql-t2s', model,
       answer, latencyMs,
-      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd }),
+      breakdown: buildBreakdown(latencyMs, { llmReportedMs, numTurns, costUsd, outputTokens }),
     };
   }
 
   // OpenRouter path — OpenAI-format tool calling against our in-process run_sql executor
   if (provider?.name === 'openrouter') {
-    const { answer, latencyMs } = await callOpenRouterWithTools(
+    const { answer, latencyMs, inputTokens, outputTokens, numTurns } = await callOpenRouterWithTools(
       withPatientContext(q, q.question),
       model,
       {
@@ -982,7 +1194,7 @@ export async function runSqlT2S(q: EvalQuestion, pool: pg.Pool, model: string, o
         executor: buildSqlExecutor(pool),
       },
     );
-    return { questionId: q.id, system: 'sql-t2s', model, answer, latencyMs, breakdown: buildBreakdown(latencyMs) };
+    return { questionId: q.id, system: 'sql-t2s', model, answer, latencyMs, breakdown: buildBreakdown(latencyMs, { inputTokens, outputTokens, numTurns }) };
   }
 
   // Ollama path — native tool calling against the same in-process run_sql

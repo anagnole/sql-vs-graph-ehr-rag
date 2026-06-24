@@ -12,10 +12,7 @@
     "pg:ingest": "tsx src/sql/ingest.ts",
     "pg:verify": "tsx src/sql/verify.ts",
     "prompt:verify": "tsx src/prompt/verify.ts",
-    "eval": "tsx src/eval/run.ts",
-    "ui:dev": "concurrently \"tsx src/api/server.ts\" \"vite --config src/ui/vite.config.ts\"",
-    "ui:build": "vite build --config src/ui/vite.config.ts",
-    "ui": "npm run ui:build && tsx src/api/server.ts"
+    "eval": "tsx src/eval/run.ts"
   },
   "dependencies": {
     "@anagnole/claude-cli-wrapper": "^0.3.1",
